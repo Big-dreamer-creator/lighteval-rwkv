@@ -261,6 +261,27 @@ def _native_score(pipeline: Any, task_name: str, metrics: dict[str, Any]) -> flo
     return _metric_value(values[0])
 
 
+def _internal_task_name(pipeline: Any, public_task_name: str) -> str:
+    """Translate LightEval's display name back to its internal task key.
+
+    ``EvaluationTracker.generate_final_dict`` replaces the separator in a
+    full task name (``task|fewshot``) with ``:`` for display.  Task selectors
+    themselves may also contain colons, so a plain ``replace`` in the other
+    direction is ambiguous; use the pipeline's authoritative task map.
+    """
+    task_names = pipeline.tasks_dict
+    if public_task_name in task_names:
+        return public_task_name
+    display_to_internal = {name.replace("|", ":"): name for name in task_names}
+    try:
+        return display_to_internal[public_task_name]
+    except KeyError as error:
+        raise KeyError(
+            f"LightEval returned task {public_task_name!r}, but the pipeline contains "
+            f"{sorted(task_names)!r}"
+        ) from error
+
+
 def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling: SamplingConfig) -> Score:
     task = pipeline.tasks_dict[task_name]
     native_details = pipeline.get_details().get(task_name, [])
@@ -438,9 +459,10 @@ async def evaluate(  # noqa: C901
             await asyncio.to_thread(pipeline.evaluate)
             await asyncio.to_thread(pipeline.show_results)
             result = pipeline.get_results()
-            for task_name, metrics in result["results"].items():
-                if task_name == "all" or ":_average|" in task_name:
+            for public_task_name, metrics in result["results"].items():
+                if public_task_name == "all" or ":_average|" in public_task_name:
                     continue
+                task_name = _internal_task_name(pipeline, public_task_name)
                 score = _make_score(pipeline, task_name, metrics, sampling)
                 successful.append(score)
                 score_path = _persist_score(
