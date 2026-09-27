@@ -79,5 +79,5 @@ Use uv to manage the local and remote dedicated environment ./.venv. This projec
 url: api.rwkv.rs
 1.5B: bsz1024
 2.9B: bsz1024
-7.2B: bsz960
-13.3B: bsz320
+7.2B: bsz512
+13.3B: bsz1280
