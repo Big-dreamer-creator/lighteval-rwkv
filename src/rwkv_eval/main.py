@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -67,8 +68,22 @@ def _prompt_template(selector: str, requested: str) -> str:
     return "bot" if any(keyword in name for keyword in difficult) else "assistant"
 
 
-def _order_benchmarks(benchmarks: Sequence[BenchmarkSpec], max_samples: int | None) -> list[BenchmarkSpec]:
-    """Order tasks without generation/CoT first, then sort by sample count."""
+def _order_benchmarks(
+    benchmarks: Sequence[BenchmarkSpec],
+    max_samples: int | None,
+    *,
+    lightweight: bool = False,
+) -> list[BenchmarkSpec]:
+    """Order tasks without generation/CoT first, then sort by sample count.
+
+    A normal run calculates the exact count after applying each task's
+    formatter/filter.  Test runs only need a stable size estimate: loading all
+    subtasks just to sort them can take longer than the evaluation itself (for
+    example, MMLU and C-Eval expand to dozens of datasets).  In lightweight
+    mode we load one representative subtask per selector and scale its count
+    by the number of matched subtasks.  This preserves the intended ordering
+    while keeping the test-mode startup bounded.
+    """
     from lighteval.tasks.lighteval_task import LightevalTask
     from lighteval.tasks.registry import Registry
     from lighteval.tasks.requests import SamplingMethod
@@ -83,19 +98,60 @@ def _order_benchmarks(benchmarks: Sequence[BenchmarkSpec], max_samples: int | No
             for task in tasks.values()
             if task.name == selector or task.name.startswith(f"{selector}:")
         ]
+        requires_cot = any(SamplingMethod.GENERATIVE in task.sampling_methods for task in matched)
         sample_count = 0
-        requires_cot = False
-        for task in matched:
+
+        if lightweight and matched:
+            representative = matched[0]
+            started = time.perf_counter()
             try:
-                LightevalTask.load_datasets({task.full_name: task}, 1)
-                sample_count += sum(len(task.dataset[split]) for split in task.evaluation_split)
-                requires_cot |= SamplingMethod.GENERATIVE in task.sampling_methods
+                LightevalTask.load_datasets({representative.full_name: representative}, 1)
+                representative_count = sum(
+                    len(representative.dataset[split]) for split in representative.evaluation_split
+                )
+                if max_samples is not None:
+                    representative_count = min(representative_count, max_samples)
+                sample_count = representative_count * len(matched)
+                LOGGER.info(
+                    "benchmark size estimate: selector=%s subtasks=%d representative_samples=%d load_seconds=%.2f",
+                    spec.selector,
+                    len(matched),
+                    representative_count,
+                    time.perf_counter() - started,
+                )
+            except Exception as error:
+                # The actual pipeline will still report a hard dataset error if
+                # this selector cannot be loaded.  Do not make ordering itself
+                # fail and hide the actionable error behind a pre-scan.
+                LOGGER.warning(
+                    "could not estimate benchmark size for %s (%s); using subtask-count fallback",
+                    spec.selector,
+                    error,
+                )
+                sample_count = (max_samples or 1) * len(matched)
             finally:
-                task.dataset = None
-                task._docs = None
-                task._fewshot_docs = None
-        if max_samples is not None:
-            sample_count = min(sample_count, max_samples * max(len(matched), 1))
+                representative.dataset = None
+                representative._docs = None
+                representative._fewshot_docs = None
+        else:
+            for task in matched:
+                started = time.perf_counter()
+                try:
+                    LightevalTask.load_datasets({task.full_name: task}, 1)
+                    sample_count += sum(len(task.dataset[split]) for split in task.evaluation_split)
+                    LOGGER.info(
+                        "benchmark subtask loaded: task=%s samples=%d load_seconds=%.2f",
+                        task.full_name,
+                        sum(len(task.dataset[split]) for split in task.evaluation_split),
+                        time.perf_counter() - started,
+                    )
+                finally:
+                    task.dataset = None
+                    task._docs = None
+                    task._fewshot_docs = None
+            if max_samples is not None:
+                sample_count = min(sample_count, max_samples * max(len(matched), 1))
+
         estimates[spec.selector] = (sample_count, int(requires_cot))
 
     ordered = sorted(
@@ -340,7 +396,11 @@ async def evaluate(  # noqa: C901
             effective_max_samples,
         )
 
-    benchmarks = _order_benchmarks(benchmarks, effective_max_samples)
+    benchmarks = _order_benchmarks(
+        benchmarks,
+        effective_max_samples,
+        lightweight=test_mode,
+    )
     sampling = _sampling_config(cot_mode, max_generated_tokens, seed)
     successful: list[Score] = []
     pending: list[tuple[Score, BenchmarkField, Path]] = []

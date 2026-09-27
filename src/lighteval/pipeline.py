@@ -28,6 +28,7 @@ import gc
 import os
 import random
 import re
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -414,12 +415,19 @@ class Pipeline:
                 len(task_items) - task_index,
             )
 
+            dataset_started = time.perf_counter()
             LightevalTask.load_datasets({task_name: task}, self.pipeline_parameters.dataset_loading_processes)
+            logger.info(
+                "streaming dataset loaded: task=%s seconds=%.2f",
+                task_name,
+                time.perf_counter() - dataset_started,
+            )
             self._configure_sampling_counts([task])
             docs = task.get_docs(task_limit)
             if total_remaining is not None:
                 total_remaining -= len(docs)
             self.task_sample_counts[task_name] = len(docs)
+            logger.info("streaming task prepared: task=%s samples=%d", task_name, len(docs))
             self.task_avg_k[task_name] = max((doc.num_samples for doc in docs), default=1)
             sampling_docs = collections.defaultdict(list)
             for doc in docs:
