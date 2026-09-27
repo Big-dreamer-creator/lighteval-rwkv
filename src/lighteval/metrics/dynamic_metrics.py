@@ -221,21 +221,31 @@ class MultilingualExtractiveMatchMetric(SampleLevelComputation):
         golds = doc.get_golds()
         predictions = model_response.final_text
 
-        gold_extraction_regexes = get_extraction_regexes(doc, self.gold_extraction_target, self.language)
-        pred_extraction_regexes = get_extraction_regexes(doc, self.pred_extraction_target, self.language)
+        if doc.specific and doc.specific.get("_rwkv_choice_extractor") and doc.choices:
+            from src.rwkv_eval.answer_extract.multi_choices import extract_choice_indices
 
-        extracted_predictions = [
-            extract_target_from_pred(
-                pred, pred_extraction_regexes, self.fallback_mode, self.extraction_mode, self.timeout_seconds
-            )
-            for pred in predictions
-        ]
-        extracted_golds = [
-            extract_target_from_pred(
-                gold, gold_extraction_regexes, self.fallback_mode, self.extraction_mode, self.timeout_seconds
-            )
-            for gold in golds
-        ]
+            extracted_predictions = [
+                list(extract_choice_indices(pred, len(doc.choices)) or ()) for pred in predictions
+            ]
+            gold_index = doc.gold_index[0] if isinstance(doc.gold_index, list) else doc.gold_index
+            extracted_golds = [[str(gold_index)]]
+            extracted_predictions = [[str(index) for index in prediction] for prediction in extracted_predictions]
+        else:
+            gold_extraction_regexes = get_extraction_regexes(doc, self.gold_extraction_target, self.language)
+            pred_extraction_regexes = get_extraction_regexes(doc, self.pred_extraction_target, self.language)
+
+            extracted_predictions = [
+                extract_target_from_pred(
+                    pred, pred_extraction_regexes, self.fallback_mode, self.extraction_mode, self.timeout_seconds
+                )
+                for pred in predictions
+            ]
+            extracted_golds = [
+                extract_target_from_pred(
+                    gold, gold_extraction_regexes, self.fallback_mode, self.extraction_mode, self.timeout_seconds
+                )
+                for gold in golds
+            ]
 
         # Assert on empty gold and warn on empty pred
         if any(len(g) == 0 for g in extracted_golds):
@@ -253,10 +263,13 @@ class MultilingualExtractiveMatchMetric(SampleLevelComputation):
         except TimeoutError:  # noqa: E722
             logger.warning("Timeout when adding extracted predictions and golds to specific")
 
+        rwkv_choice_extractor = bool(doc.specific and doc.specific.get("_rwkv_choice_extractor"))
         return self.aggregation_function(
             [
                 (
-                    1.0
+                    0.25
+                    if rwkv_choice_extractor and not pred
+                    else 1.0
                     if any(
                         compare_gold_target(gold, pred, self.precision, timeout_seconds=self.timeout_seconds)
                         for gold in extracted_golds

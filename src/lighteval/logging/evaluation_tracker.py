@@ -151,6 +151,7 @@ class EvaluationTracker:
         public: bool = False,
         nanotron_run_info: "GeneralArgs" = None,
         use_wandb: bool = False,
+        save_streaming_completions: bool = False,
     ) -> None:
         """Creates all the necessary loggers for evaluation tracking."""
         self.details_logger = DetailsLogger()
@@ -177,6 +178,9 @@ class EvaluationTracker:
         self.tensorboard_metric_prefix = tensorboard_metric_prefix
         self.nanotron_run_info = nanotron_run_info
         self.results_path_template = results_path_template
+        self.save_streaming_completions = save_streaming_completions
+        self._streaming_date_id = datetime.now().isoformat().replace(":", "-")
+        self._streaming_completions_path: str | None = None
 
         self.public = public
 
@@ -224,6 +228,8 @@ class EvaluationTracker:
             "summary_tasks": self.details_logger.compiled_details,
             "summary_general": asdict(self.details_logger.compiled_details_over_all_tasks),
         }
+        if self._streaming_completions_path is not None:
+            results["completions_path"] = self._streaming_completions_path
         return results
 
     @property
@@ -251,7 +257,7 @@ class EvaluationTracker:
     def save(self) -> None:
         """Saves the experiment information and results to files, and to the hub if requested."""
         logger.info("Saving experiment tracker")
-        date_id = datetime.now().isoformat().replace(":", "-")
+        date_id = self._streaming_date_id if self.save_streaming_completions else datetime.now().isoformat().replace(":", "-")
 
         results_dict = self.results
 
@@ -302,6 +308,28 @@ class EvaluationTracker:
             {**results_dict},
         )
         self.wandb_run.finish()
+
+    def append_streaming_completion(self, task_name: str, doc, model_response, metrics: dict) -> None:
+        """Durably append one evaluated sample without retaining it in memory."""
+        if not self.save_streaming_completions:
+            return
+        if self._streaming_completions_path is None:
+            output_dir = Path(self.output_dir) / "completions" / self.general_config_logger.model_name.strip("/")
+            self.fs.mkdirs(output_dir, exist_ok=True)
+            self._streaming_completions_path = str(output_dir / f"completions_{self._streaming_date_id}.jsonl")
+        record = {
+            "task_name": task_name,
+            "doc": asdict(doc),
+            "model_response": asdict(model_response),
+            "metrics": metrics,
+        }
+        with self.fs.open(self._streaming_completions_path, "a") as stream:
+            stream.write(json.dumps(record, cls=EnhancedJSONEncoder, ensure_ascii=False) + "\n")
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except (AttributeError, OSError):
+                pass
 
     def save_results(self, date_id: str, results_dict: dict):
         if self.results_path_template is not None:

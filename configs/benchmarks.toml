@@ -1,0 +1,48 @@
+knowledge = [
+  "mmlu",
+  "mmlu_pro",
+  "mmlu_redux_2",
+  "gpqa:diamond",
+  "gpqa:main",
+  "arc:challenge",
+  "arc:easy",
+  "agieval",
+  "truthfulqa:mc",
+  "openbookqa",
+  "ceval_zho_mcf",
+  "med_qa",
+  "med_mcqa",
+]
+
+reasoning = [
+  "hellaswag",
+  "bigbench_hard",
+  "winogrande",
+  "commonsenseqa",
+]
+
+maths = [
+  "gsm8k",
+  "gsm_plus",
+  "asdiv",
+  "mathqa",
+  "arithmetic",
+  "math_500",
+  "math",
+  "aime24",
+  "aime25",
+  "aimo_progress_prize_1",
+  "olympiad_bench",
+]
+
+coding = [
+  "lcb:codegeneration",
+]
+
+agentic = []
+
+instruction_following = [
+  "ifeval",
+  "ifbench_test",
+  "ifbench_multiturn",
+]

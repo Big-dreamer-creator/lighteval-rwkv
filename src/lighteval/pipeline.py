@@ -23,8 +23,11 @@
 import ast
 import asyncio
 import collections
+import copy
+import gc
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -95,6 +98,13 @@ class PipelineParameters:
     load_responses_from_details_date_id: str | None = None
     bootstrap_iters: int = 1000
     load_tasks_multilingual: bool = False
+    # Optional backend hint: choose a sampling count that keeps a large endpoint
+    # pool busy without putting backend scheduling policy in a CLI entry point.
+    target_completions: int = 0
+    minimum_completions: int = 0
+    maximum_completions: int = 0
+    streaming_evaluation: bool = False
+    max_streaming_details: int = 60
 
     def __post_init__(self):  # noqa C901
         if not isinstance(self.reasoning_tags, list):
@@ -112,6 +122,16 @@ class PipelineParameters:
                 "reasoning_tags must be a list of pair tuples, e.g. [('start_tag', 'end_tag'), ...]. "
                 f"Got {self.reasoning_tags} instead."
             )
+        if self.max_samples is not None and self.max_samples <= 0:
+            raise ValueError("max_samples must be positive or None")
+        for name in ("target_completions", "minimum_completions", "maximum_completions"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.maximum_completions and self.maximum_completions < self.minimum_completions:
+            raise ValueError("maximum_completions must be greater than or equal to minimum_completions")
+        if self.max_streaming_details <= 0:
+            raise ValueError("max_streaming_details must be positive")
 
 
 class Pipeline:
@@ -136,6 +156,13 @@ class Pipeline:
         self.launcher_type = self.pipeline_parameters.launcher_type
         self._metric_options = metric_options or {}
         self.evaluation_tracker = evaluation_tracker
+        self._backend_sampling = getattr(model, "config", None) or model_config
+        self.streaming_details: dict[str, list] = collections.defaultdict(list)
+        self.streaming_detail_counts: dict[str, list[int]] = collections.defaultdict(lambda: [0, 0, 0])
+        self.task_sample_counts: dict[str, int] = {}
+        self.task_avg_k: dict[str, int] = {}
+        self.task_completion_counts: dict[str, int] = {}
+        self.task_truncation_counts: dict[str, int] = {}
 
         # We init tasks first to fail fast if one is badly defined
         self._init_random_seeds()
@@ -217,18 +244,25 @@ class Pipeline:
             custom_tasks=self.pipeline_parameters.custom_tasks_directory,
         )
 
-        # load the tasks from the configs and their datasets
+        # Load task definitions first. Streaming backends load one task's data
+        # only when that task is about to run.
         self.tasks_dict: dict[str, LightevalTask] = self.registry.load_tasks()
-        LightevalTask.load_datasets(self.tasks_dict, self.pipeline_parameters.dataset_loading_processes)
-        self.documents_dict = {
-            task.full_name: task.get_docs(self.pipeline_parameters.max_samples) for _, task in self.tasks_dict.items()
-        }
+        if self.pipeline_parameters.streaming_evaluation:
+            self.documents_dict = {}
+            self.sampling_docs = collections.defaultdict(list)
+        else:
+            LightevalTask.load_datasets(self.tasks_dict, self.pipeline_parameters.dataset_loading_processes)
+            self._configure_sampling_counts()
+            self.documents_dict = {
+                task.full_name: task.get_docs(self.pipeline_parameters.max_samples)
+                for _, task in self.tasks_dict.items()
+            }
 
-        self.sampling_docs = collections.defaultdict(list)
-        for _, docs in self.documents_dict.items():
-            for doc in docs:
-                for sampling in doc.sampling_methods:
-                    self.sampling_docs[sampling].append(doc)
+            self.sampling_docs = collections.defaultdict(list)
+            for _, docs in self.documents_dict.items():
+                for doc in docs:
+                    for sampling in doc.sampling_methods:
+                        self.sampling_docs[sampling].append(doc)
 
         # If there are metric_options defined from the yaml file,
         # review if they have to be updated.
@@ -236,6 +270,53 @@ class Pipeline:
             self._update_num_samples(list(self.tasks_dict.values()))
 
         self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
+
+    def _configure_sampling_counts(self, tasks=None) -> None:  # noqa: C901
+        """Configure sampling metrics from backend capacity, when requested.
+
+        This is deliberately opt-in. Native backends keep their existing task
+        configuration, while endpoint backends can ask the pipeline to select a
+        power-of-two avg@k without reimplementing task loading in their CLI.
+        """
+        params = self.pipeline_parameters
+        target = params.target_completions or getattr(self._backend_sampling, "target_completions", 0)
+        if target <= 0:
+            return
+        minimum = params.minimum_completions or getattr(self._backend_sampling, "minimum_completions", 0)
+        maximum = params.maximum_completions or getattr(self._backend_sampling, "maximum_completions", 0)
+
+        for task in tasks or self.tasks_dict.values():
+            docs = task.eval_docs()
+            if not docs:
+                continue
+            count = len(docs) if params.max_samples is None else min(params.max_samples, len(docs))
+            if params.max_samples is not None:
+                k = 1
+            else:
+                lower = minimum
+                upper = maximum or target * 2
+                k = 1
+                while k * count < lower:
+                    k *= 2
+                candidates = []
+                while k * count <= upper:
+                    candidates.append(k)
+                    k *= 2
+                if candidates:
+                    k = min(candidates, key=lambda value: (abs(value * count - target), value))
+
+            sampling_metric_found = False
+            for metric in task.metrics:
+                sample_fn = getattr(metric, "sample_level_fn", None)
+                if hasattr(sample_fn, "n"):
+                    sample_fn.n = k
+                    sampling_metric_found = True
+                    if isinstance(metric.metric_name, list):
+                        metric.metric_name = [re.sub(r"n=\d+", f"n={k}", name) for name in metric.metric_name]
+                    else:
+                        metric.metric_name = re.sub(r"n=\d+", f"n={k}", metric.metric_name)
+            if sampling_metric_found:
+                task.num_samples = [k]
 
     def _update_num_samples(self, tasks: list[LightevalTask]):
         """Helper function to update the num_samples of a given metric via the yaml file.
@@ -275,30 +356,76 @@ class Pipeline:
             job_id=str(self.pipeline_parameters.job_id),
         )
 
-        if self.pipeline_parameters.load_responses_from_details_date_id:
-            try:
-                outputs = self._load_responses_from_details()
-            except FileNotFoundError as e:
-                logger.warning(
-                    f"No responses found for {self.pipeline_parameters.load_responses_from_details_date_id} in details directory: {e}. Running model instead."
-                )
-                outputs = self._run_model()
+        if self.pipeline_parameters.streaming_evaluation:
+            self._evaluate_streaming()
         else:
-            outputs = self._run_model()
+            if self.pipeline_parameters.load_responses_from_details_date_id:
+                try:
+                    outputs = self._load_responses_from_details()
+                except FileNotFoundError as e:
+                    logger.warning(
+                        f"No responses found for {self.pipeline_parameters.load_responses_from_details_date_id} in details directory: {e}. Running model instead."
+                    )
+                    outputs = self._run_model()
+            else:
+                outputs = self._run_model()
+
+            if self.is_main_process():
+                self._post_process_outputs(outputs)
+                self._compute_metrics(outputs)
 
         if self.is_main_process():
-            self._post_process_outputs(outputs)
-            self._compute_metrics(outputs)
-
             self.evaluation_tracker.general_config_logger.log_end_time()
             self.evaluation_tracker.metrics_logger.aggregate(
                 task_dict=self.tasks_dict, bootstrap_iters=self.pipeline_parameters.bootstrap_iters
             )
-            self.evaluation_tracker.details_logger.aggregate()
+            if not self.pipeline_parameters.streaming_evaluation:
+                self.evaluation_tracker.details_logger.aggregate()
 
-    async def _run_model_async(self):
+    def _evaluate_streaming(self) -> None:
+        """Evaluate one task at a time and retain only bounded diagnostics."""
+        for task_name, task in self.tasks_dict.items():
+            LightevalTask.load_datasets({task_name: task}, self.pipeline_parameters.dataset_loading_processes)
+            self._configure_sampling_counts([task])
+            docs = task.get_docs(self.pipeline_parameters.max_samples)
+            self.task_sample_counts[task_name] = len(docs)
+            self.task_avg_k[task_name] = max((doc.num_samples for doc in docs), default=1)
+            sampling_docs = collections.defaultdict(list)
+            for doc in docs:
+                for sampling in doc.sampling_methods:
+                    sampling_docs[sampling].append(doc)
+
+            outputs = self._run_model_for_docs(sampling_docs)
+            responses = [response for group in outputs.values() for response in group]
+            self.task_completion_counts[task_name] = sum(len(response.text) for response in responses)
+            self.task_truncation_counts[task_name] = sum(
+                sum(reason.lower() in {"length", "max_tokens"} for reason in response.finish_reasons)
+                for response in responses
+            )
+            if self.is_main_process():
+                self._post_process_outputs(outputs)
+                for sampling_method, responses_for_method in outputs.items():
+                    for doc, response in zip(sampling_docs[sampling_method], responses_for_method):
+                        self.evaluation_tracker.append_streaming_completion(task_name, doc, response, {})
+                self._compute_metrics_for_sampling(sampling_docs, outputs)
+
+            self._release_task(task)
+            del outputs, responses, sampling_docs, docs
+            gc.collect()
+
+    def _release_task(self, task: LightevalTask) -> None:
+        self.documents_dict.pop(task.full_name, None)
+        task.dataset = None
+        task._docs = None
+        task._fewshot_docs = None
+        sampler = getattr(task, "fewshot_sampler", None)
+        if sampler is not None and hasattr(sampler, "_fewshot_cache"):
+            sampler._fewshot_cache.clear()
+
+    async def _run_model_async(self, sampling_docs=None):
         outputs = {}
-        for sampling_method, docs in self.sampling_docs.items():
+        sampling_docs = sampling_docs or self.sampling_docs
+        for sampling_method, docs in sampling_docs.items():
             logger.info(f"Running {sampling_method} requests")
             match sampling_method:
                 case SamplingMethod.GENERATIVE:
@@ -310,11 +437,12 @@ class Pipeline:
 
         return outputs
 
-    def _run_model_sync(self):
+    def _run_model_sync(self, sampling_docs=None):
         # Running all requests depending on the model call type (log likelihood, generative, ...)
         # to be able to batch them
         outputs = {}
-        for sampling_method, docs in self.sampling_docs.items():
+        sampling_docs = sampling_docs or self.sampling_docs
+        for sampling_method, docs in sampling_docs.items():
             logger.info(f"Running {sampling_method} requests")
             match sampling_method:
                 case SamplingMethod.GENERATIVE:
@@ -329,30 +457,33 @@ class Pipeline:
 
         return outputs
 
-    def _run_model(self):
-        # Running all requests depending on the model call type (log likelihood, generative, ...)
-        # to be able to batch them
+    def _run_model_for_docs(self, sampling_docs):
         logger.info("--- RUNNING MODEL ---")
-
         if self.model.is_async:
-            outputs = asyncio.run(self._run_model_async())
+            outputs = asyncio.run(self._run_model_async(sampling_docs))
         else:
-            outputs = self._run_model_sync()
-
-        # Cleaning up the model before running metrics
+            outputs = self._run_model_sync(sampling_docs)
         self.model.cleanup()
-
         return outputs
+
+    def _run_model(self):
+        return self._run_model_for_docs(self.sampling_docs)
 
     def _post_process_outputs(self, sampling_method_responses: dict[str, list[ModelResponse]]):
         # Removes reasoning tags if needed
         logger.info("--- POST-PROCESSING MODEL RESPONSES ---")
 
         if self.pipeline_parameters.remove_reasoning_tags:
+            rwkv_generation = getattr(getattr(self.model, "config", None), "generation_only", False)
+            if rwkv_generation:
+                from src.rwkv_eval.answer_extract.free_response import extract_free_response
+
             for _, responses in sampling_method_responses.items():
                 for response in responses:
                     response.text_post_processed = [
-                        remove_reasoning_tags(
+                        extract_free_response(text)
+                        if rwkv_generation
+                        else remove_reasoning_tags(
                             text=text,
                             tag_pairs=self.pipeline_parameters.reasoning_tags,
                         )
@@ -397,6 +528,70 @@ class Pipeline:
                 for output, doc, response in zip(outputs, docs, responses):
                     self.evaluation_tracker.metrics_logger.log(task_name, output)
                     self.evaluation_tracker.details_logger.log(task_name, doc, response, output)
+
+    def _compute_metrics_for_sampling(self, sampling_docs, sampling_method_responses):
+        task_metric_category_groups = collections.defaultdict(lambda: collections.defaultdict(list))
+        remaining = collections.Counter(
+            id(doc) for docs in sampling_docs.values() for doc in docs
+        )
+        for sampling_method, model_responses in sampling_method_responses.items():
+            for doc, response in zip(sampling_docs[sampling_method], model_responses):
+                task_metric_category_groups[doc.task_name][sampling_method].append((doc, response))
+
+        for task_name, samples_per_method in task_metric_category_groups.items():
+            task = self.tasks_dict[task_name]
+            for sampling_method, samples in samples_per_method.items():
+                metrics = [metric for metric in task.metrics if metric.category == sampling_method]
+                docs = [doc for doc, _ in samples]
+                responses = [response for _, response in samples]
+                if self.pipeline_parameters.streaming_evaluation and not any(
+                    metric.batched_compute for metric in metrics
+                ):
+                    outputs = [
+                        apply_metric(docs=[doc], responses=[response], metrics=metrics)[0]
+                        for doc, response in zip(docs, responses)
+                    ]
+                else:
+                    outputs = apply_metric(docs=docs, responses=responses, metrics=metrics)
+                for output, doc, response in zip(outputs, docs, responses):
+                    self.evaluation_tracker.metrics_logger.log(task_name, output)
+                    self._retain_streaming_detail(task_name, doc, response, output)
+                    remaining[id(doc)] -= 1
+                    if remaining[id(doc)] == 0:
+                        self._release_sample(doc, response)
+
+    def _retain_streaming_detail(self, task_name, doc, response, output) -> None:
+        answers = response.final_text or [""]
+        finish_reasons = getattr(response, "finish_reasons", [])
+        failed = any(
+            index < len(finish_reasons) and finish_reasons[index].lower() in {"length", "max_tokens"}
+            or not str(answer).strip()
+            for index, answer in enumerate(answers)
+        )
+        values = [value for value in output.values() if isinstance(value, (int, float))]
+        passed = not failed and bool(values) and all(value == 1.0 for value in values)
+        bucket = 2 if failed else 0 if passed else 1
+        counts = self.streaming_detail_counts[task_name]
+        if counts[bucket] >= 20:
+            return
+        counts[bucket] += 1
+        self.streaming_details[task_name].append(
+            self.evaluation_tracker.details_logger.Detail(
+                copy.deepcopy(doc), copy.deepcopy(response), copy.deepcopy(output)
+            )
+        )
+
+    @staticmethod
+    def _release_sample(doc, response) -> None:
+        doc.query = ""
+        doc.instruction = None
+        doc.fewshot_samples = []
+        doc.images = None
+        response.input = None
+        response.text.clear()
+        response.text_post_processed = []
+        response.reasonings.clear()
+        response.finish_reasons.clear()
 
     def _load_responses_from_details(self):
         logger.info("--- LOADING RESPONSES FROM DETAILS ---")
@@ -444,4 +639,6 @@ class Pipeline:
         return self.final_dict
 
     def get_details(self):
+        if self.pipeline_parameters.streaming_evaluation:
+            return self.streaming_details
         return self.evaluation_tracker.details_logger.details

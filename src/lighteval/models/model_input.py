@@ -118,6 +118,8 @@ class GenerationParameters(BaseModel, extra="forbid"):
             "seed": self.seed,
             "repetition_penalty": self.repetition_penalty,
             "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": self.presence_penalty,
+            "top_k": self.top_k,
         }
         return {k: v for k, v in args.items() if v is not None}
 

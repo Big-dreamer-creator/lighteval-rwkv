@@ -137,6 +137,7 @@ class ModelResponse:
     # Other metadata
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
+    finish_reasons: list[str] = field(default_factory=list)
 
     @property
     def final_text(self) -> list[str]:
@@ -149,11 +150,14 @@ class ModelResponse:
             input=self.input,
             input_tokens=self.input_tokens,
             text=[self.text[index]],
+            text_post_processed=[self.text_post_processed[index]] if self.text_post_processed else None,
             output_tokens=[self.output_tokens[index]] if self.output_tokens else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,
             unconditioned_logprobs=[self.unconditioned_logprobs[index]] if self.unconditioned_logprobs else None,
+            reasonings=[self.reasonings[index]] if self.reasonings else [],
+            finish_reasons=[self.finish_reasons[index]] if self.finish_reasons else [],
             truncated_tokens_count=self.truncated_tokens_count,
             padded_tokens_count=self.padded_tokens_count,
         )

@@ -21,9 +21,11 @@
 # SOFTWARE.
 
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
+from typing import Any
 
 import requests
 from pydantic import SecretStr
@@ -132,6 +134,13 @@ class LiteLLMModelConfig(ModelConfig):
     api_retry_sleep: float = 1.0
     api_retry_multiplier: float = 2.0
     timeout: float | None = None
+    # Parameters accepted by an OpenAI-compatible server but not normalized by
+    # LiteLLM are forwarded through the provider's extra_body mechanism.
+    extra_body: dict[str, Any] | None = None
+    generation_only: bool = False
+    target_completions: int = 0
+    minimum_completions: int = 0
+    maximum_completions: int = 0
 
 
 @requires("litellm")
@@ -221,7 +230,10 @@ class LiteLLMClient(LightevalModel):
 
         if kwargs.get("max_completion_tokens", None) is None:
             kwargs["max_completion_tokens"] = max_new_tokens
+        if self.config.extra_body:
+            kwargs["extra_body"] = self.config.extra_body
 
+        last_error: BaseException | None = None
         for attempt in range(self.API_MAX_RETRY):
             try:
                 response = litellm.completion(**kwargs)
@@ -244,6 +256,7 @@ class LiteLLMClient(LightevalModel):
                         logger.warning(f"{error_string}. Returning empty response.")
                         return LitellmModelResponse()
             except Exception as e:
+                last_error = e
                 wait_time = min(
                     64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
                 )  # Exponential backoff with max 64s
@@ -252,7 +265,10 @@ class LiteLLMClient(LightevalModel):
                 )
                 time.sleep(wait_time)
 
-        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
+        message = f"API call failed after {self.API_MAX_RETRY} attempts"
+        logger.error(message)
+        if self.config.generation_only:
+            raise RuntimeError(message) from last_error
         return LitellmModelResponse()
 
     def __call_api_parallel(
@@ -349,6 +365,9 @@ class LiteLLMClient(LightevalModel):
             position=0,
             disable=self.disable_tqdm,
         ):
+            if self.config.generation_only:
+                for doc in split:
+                    self._prepare_choice_doc(doc)
             contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
             max_new_tokens = split[0].generation_size  # could be none
             return_logits = split[0].use_logits
@@ -367,11 +386,13 @@ class LiteLLMClient(LightevalModel):
                 reasonings: list[str | None] = [
                     getattr(choice.message, "reasoning_content", None) for choice in response.choices
                 ]
+                finish_reasons = [getattr(choice, "finish_reason", "stop") or "stop" for choice in response.choices]
 
                 cur_response = ModelResponse(
                     # In empty responses, the model should return an empty string instead of None
-                    text=result if result[0] else [""],
+                    text=result if result and result[0] else [""],
                     reasonings=reasonings,
+                    finish_reasons=finish_reasons,
                     input=context,
                 )
                 results.append(cur_response)
@@ -407,10 +428,42 @@ class LiteLLMClient(LightevalModel):
 
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
-        """Tokenize the context and continuation and compute the log likelihood of those
-        tokenized sequences.
-        """
-        raise NotImplementedError
+        """Use generated choice answers when the endpoint has no logprob API."""
+        if not self.config.generation_only:
+            raise NotImplementedError
+        responses = self.greedy_until(docs)
+        for doc, response in zip(docs, responses):
+            predicted = self._choice_index(response.final_text[0], len(doc.choices)) if doc.choices else None
+            if doc.specific is None:
+                doc.specific = {}
+            doc.specific["_rwkv_missing_answer"] = predicted is None
+            response.logprobs = (
+                [0.0 if index == predicted else -1.0 for index in range(len(doc.choices))]
+                if predicted is not None
+                else [0.0 for _ in doc.choices]
+            )
+            response.output_tokens = [[] for _ in doc.choices]
+        return responses
+
+    @staticmethod
+    def _prepare_choice_doc(doc: Doc) -> None:
+        if not isinstance(doc.choices, list) or len(doc.choices) < 2:
+            return
+        if doc.specific is None:
+            doc.specific = {}
+        doc.specific["_rwkv_choice_extractor"] = True
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
+        if not any(re.search(rf"(?m)^\s*{label}\s*[.):]", doc.query) for label in labels):
+            options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices))
+            doc.query = f"{doc.query.rstrip()}\n\n{options}\n\nAnswer:"
+        doc.stop_sequences = []
+
+    @staticmethod
+    def _choice_index(text: str, choice_count: int) -> int | None:
+        from src.rwkv_eval.answer_extract.multi_choices import extract_choice_indices
+
+        indices = extract_choice_indices(text, choice_count)
+        return indices[0] if indices else None
 
     @cached(SamplingMethod.PERPLEXITY)
     def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:
