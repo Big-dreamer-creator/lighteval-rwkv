@@ -460,7 +460,11 @@ async def evaluate(  # noqa: C901
             await asyncio.to_thread(pipeline.show_results)
             result = pipeline.get_results()
             for public_task_name, metrics in result["results"].items():
-                if public_task_name == "all" or ":_average|" in public_task_name:
+                if (
+                    public_task_name == "all"
+                    or ":_average:" in public_task_name
+                    or ":_average|" in public_task_name
+                ):
                     continue
                 task_name = _internal_task_name(pipeline, public_task_name)
                 score = _make_score(pipeline, task_name, metrics, sampling)
