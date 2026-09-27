@@ -211,6 +211,10 @@ class LiteLLMClient(LightevalModel):
         # Prepare kwargs for completion call
         kwargs = {
             "model": self.model,
+            # A bare model name cannot be routed by LiteLLM.  The provider is
+            # deliberately kept in the LightEval config (rather than baked
+            # into model_name), so forward it on every request.
+            "custom_llm_provider": self.provider,
             "messages": prompt,
             "response_format": {"type": "text"},
             "max_tokens": max_new_tokens,
