@@ -21,31 +21,49 @@ paper:
 https://arxiv.org/abs/1905.13319
 """
 
+import re
+
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
 
 
+_OPTION_PATTERN = re.compile(r"(?:^|,\s*)([a-e])\s*\)\s*(.*?)(?=,\s*[a-e]\s*\)\s*|$)", re.IGNORECASE)
+
+
+def _mathqa_options(line) -> list[str]:
+    """Read both the legacy split columns and the current ``options`` field."""
+    legacy = [line.get(f"option_{label}") for label in "abcde"]
+    if all(value is not None for value in legacy):
+        return [str(value).strip() for value in legacy]
+
+    raw_options = line.get("options")
+    if isinstance(raw_options, str):
+        matches = _OPTION_PATTERN.findall(raw_options)
+        if len(matches) == 5:
+            by_label = {label.lower(): value.strip() for label, value in matches}
+            if all(label in by_label for label in "abcde"):
+                return [by_label[label] for label in "abcde"]
+    elif isinstance(raw_options, (list, tuple)) and len(raw_options) == 5:
+        return [str(value).strip() for value in raw_options]
+
+    raise KeyError("MathQA row has neither option_a..option_e nor five parseable options")
+
+
 def mathqa_prompt(line, task_name: str = None):
+    options = _mathqa_options(line)
     query = f"Problem: {line['Problem']}\n"
     query += "Options:\n"
-    query += "".join(
-        [
-            f"{key}) {choice}\n"
-            for key, choice in zip(
-                ["a", "b", "c", "d", "e"],
-                [line["option_a"], line["option_b"], line["option_c"], line["option_d"], line["option_e"]],
-            )
-        ]
-    )
+    query += "".join(f"{key}) {choice}\n" for key, choice in zip("abcde", options))
     query += "Answer:"
+    correct = re.search(r"[a-e]", str(line["correct"]).lower())
+    if correct is None:
+        raise ValueError(f"Invalid MathQA answer label: {line['correct']!r}")
     return Doc(
         task_name=task_name,
         query=query,
-        choices=[
-            f" {c}" for c in [line["option_a"], line["option_b"], line["option_c"], line["option_d"], line["option_e"]]
-        ],
-        gold_index=["a", "b", "c", "d", "e"].index(line["correct"]),
+        choices=[f" {choice}" for choice in options],
+        gold_index="abcde".index(correct.group(0)),
     )
 
 
