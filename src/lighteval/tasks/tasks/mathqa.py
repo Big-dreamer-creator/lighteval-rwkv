@@ -21,6 +21,7 @@ paper:
 https://arxiv.org/abs/1905.13319
 """
 
+import ast
 import re
 
 from lighteval.metrics.metrics import Metrics
@@ -31,7 +32,7 @@ from lighteval.tasks.requests import Doc
 _OPTION_PATTERN = re.compile(r"(?:^|,\s*)([a-e])\s*\)\s*(.*?)(?=,\s*[a-e]\s*\)\s*|$)", re.IGNORECASE)
 
 
-def _mathqa_options(line) -> list[str]:
+def _mathqa_options(line) -> list[str]:  # noqa: C901
     """Read both the legacy split columns and the current ``options`` field."""
     legacy = [line.get(f"option_{label}") for label in "abcde"]
     if all(value is not None for value in legacy):
@@ -39,13 +40,27 @@ def _mathqa_options(line) -> list[str]:
 
     raw_options = line.get("options")
     if isinstance(raw_options, str):
-        matches = _OPTION_PATTERN.findall(raw_options)
-        if len(matches) == 5:
-            by_label = {label.lower(): value.strip() for label, value in matches}
-            if all(label in by_label for label in "abcde"):
-                return [by_label[label] for label in "abcde"]
-    elif isinstance(raw_options, (list, tuple)) and len(raw_options) == 5:
-        return [str(value).strip() for value in raw_options]
+        try:
+            parsed_options = ast.literal_eval(raw_options) if raw_options.lstrip().startswith("[") else raw_options
+        except (SyntaxError, ValueError):
+            parsed_options = raw_options
+        if isinstance(parsed_options, (list, tuple)):
+            raw_options = parsed_options
+        else:
+            matches = _OPTION_PATTERN.findall(raw_options)
+            if len(matches) == 5:
+                by_label = {label.lower(): value.strip() for label, value in matches}
+                if all(label in by_label for label in "abcde"):
+                    return [by_label[label] for label in "abcde"]
+    if isinstance(raw_options, (list, tuple)) and len(raw_options) == 5:
+        parsed = []
+        for value in raw_options:
+            match = re.match(r"\s*[a-e]\s*\)\s*(.*?)\s*$", str(value), re.IGNORECASE)
+            if match is None:
+                break
+            parsed.append(match.group(1).strip())
+        if len(parsed) == 5:
+            return parsed
 
     raise KeyError("MathQA row has neither option_a..option_e nor five parseable options")
 
