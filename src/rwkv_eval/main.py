@@ -41,6 +41,7 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_RETRIES = 5
 RETRY_DELAY = 1.0
 DEFAULT_MAX_GENERATED_TOKENS = 8192
+TEST_MODE_MAX_SAMPLES = 10
 
 BenchmarkField = Literal[
     "knowledge",
@@ -311,6 +312,7 @@ async def evaluate(  # noqa: C901
     cot_mode: CotMode = "CoT",
     prompt_template: str = "assistant",
     max_samples: int | None = None,
+    test_mode: bool = False,
     max_generated_tokens: int = DEFAULT_MAX_GENERATED_TOKENS,
     seed: int = 42,
     scoreboard_token: str | None = None,
@@ -326,7 +328,19 @@ async def evaluate(  # noqa: C901
     from lighteval.logging.evaluation_tracker import EvaluationTracker
     from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
 
-    benchmarks = _order_benchmarks(benchmarks, max_samples)
+    effective_max_samples = max_samples
+    if test_mode:
+        effective_max_samples = (
+            TEST_MODE_MAX_SAMPLES
+            if max_samples is None
+            else min(max_samples, TEST_MODE_MAX_SAMPLES)
+        )
+        LOGGER.info(
+            "test mode enabled: evaluating at most %d questions per benchmark",
+            effective_max_samples,
+        )
+
+    benchmarks = _order_benchmarks(benchmarks, effective_max_samples)
     sampling = _sampling_config(cot_mode, max_generated_tokens, seed)
     successful: list[Score] = []
     pending: list[tuple[Score, BenchmarkField, Path]] = []
@@ -353,7 +367,8 @@ async def evaluate(  # noqa: C901
             )
             params = PipelineParameters(
                 launcher_type=ParallelismManager.NONE,
-                max_samples=max_samples,
+                max_samples=effective_max_samples,
+                max_total_samples=effective_max_samples if test_mode else None,
                 load_tasks_multilingual=True,
                 streaming_evaluation=True,
             )
@@ -415,6 +430,13 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cot-mode", choices=("NoCoT", "FakeCoT", "CoT"), default="CoT")
     parser.add_argument("--prompt-template", choices=("bot", "assistant", "function_calling"), default="assistant")
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument(
+        "--test",
+        "--test-mode",
+        dest="test_mode",
+        action="store_true",
+        help=f"test mode: evaluate at most {TEST_MODE_MAX_SAMPLES} questions per benchmark",
+    )
     parser.add_argument("--max-generated-tokens", type=int, default=DEFAULT_MAX_GENERATED_TOKENS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results")
@@ -439,6 +461,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cot_mode=args.cot_mode,
             prompt_template=args.prompt_template,
             max_samples=args.max_samples,
+            test_mode=args.test_mode,
             max_generated_tokens=args.max_generated_tokens,
             seed=args.seed,
             scoreboard_token=args.scoreboard_token,

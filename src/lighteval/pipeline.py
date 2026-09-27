@@ -104,6 +104,9 @@ class PipelineParameters:
     minimum_completions: int = 0
     maximum_completions: int = 0
     streaming_evaluation: bool = False
+    # Optional selector-level cap used by RWKV test runs. max_samples remains
+    # the per-task cap; this limits the total documents for one Pipeline.
+    max_total_samples: int | None = None
     max_streaming_details: int = 60
 
     def __post_init__(self):  # noqa C901
@@ -130,6 +133,8 @@ class PipelineParameters:
                 raise ValueError(f"{name} must be a non-negative integer")
         if self.maximum_completions and self.maximum_completions < self.minimum_completions:
             raise ValueError("maximum_completions must be greater than or equal to minimum_completions")
+        if self.max_total_samples is not None and self.max_total_samples <= 0:
+            raise ValueError("max_total_samples must be positive or None")
         if self.max_streaming_details <= 0:
             raise ValueError("max_streaming_details must be positive")
 
@@ -382,12 +387,38 @@ class Pipeline:
             if not self.pipeline_parameters.streaming_evaluation:
                 self.evaluation_tracker.details_logger.aggregate()
 
+    @staticmethod
+    def _streaming_task_limit(
+        per_task_limit: int | None,
+        total_remaining: int | None,
+        tasks_remaining: int,
+    ) -> int | None:
+        if total_remaining is None:
+            return per_task_limit
+        fair_limit = (total_remaining + tasks_remaining - 1) // tasks_remaining
+        return fair_limit if per_task_limit is None else min(per_task_limit, fair_limit)
+
     def _evaluate_streaming(self) -> None:
         """Evaluate one task at a time and retain only bounded diagnostics."""
-        for task_name, task in self.tasks_dict.items():
+        task_items = list(self.tasks_dict.items())
+        total_remaining = self.pipeline_parameters.max_total_samples
+        if total_remaining is not None:
+            task_items.sort(key=lambda item: item[0])
+
+        for task_index, (task_name, task) in enumerate(task_items):
+            if total_remaining is not None and total_remaining <= 0:
+                break
+            task_limit = self._streaming_task_limit(
+                self.pipeline_parameters.max_samples,
+                total_remaining,
+                len(task_items) - task_index,
+            )
+
             LightevalTask.load_datasets({task_name: task}, self.pipeline_parameters.dataset_loading_processes)
             self._configure_sampling_counts([task])
-            docs = task.get_docs(self.pipeline_parameters.max_samples)
+            docs = task.get_docs(task_limit)
+            if total_remaining is not None:
+                total_remaining -= len(docs)
             self.task_sample_counts[task_name] = len(docs)
             self.task_avg_k[task_name] = max((doc.num_samples for doc in docs), default=1)
             sampling_docs = collections.defaultdict(list)
