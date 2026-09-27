@@ -456,8 +456,17 @@ async def evaluate(  # noqa: C901
             pipeline = await asyncio.to_thread(
                 Pipeline, benchmark.selector, params, tracker, model_config=model_config
             )
-            await asyncio.to_thread(pipeline.evaluate)
-            await asyncio.to_thread(pipeline.show_results)
+            # Some native metrics use ``signal.SIGALRM`` for their timeout
+            # guard.  Running evaluation in ``asyncio.to_thread`` breaks
+            # those metrics because Python only permits signal handlers in
+            # the main thread.  LiteLLM is a synchronous model whose request
+            # pool already uses worker threads, so evaluate it on the main
+            # thread; retain the worker path for genuinely async models.
+            if getattr(getattr(pipeline, "model", None), "is_async", False):
+                await asyncio.to_thread(pipeline.evaluate)
+            else:
+                pipeline.evaluate()
+            pipeline.show_results()
             result = pipeline.get_results()
             for public_task_name, metrics in result["results"].items():
                 if (
