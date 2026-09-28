@@ -179,7 +179,15 @@ def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingC
     return SamplingConfig(max_tokens, temp, top_k, top_p, presence, frequency, decay, seed)
 
 
-def _litelm_model(endpoint: ModelEndpoint, replicas: Sequence[ModelEndpoint], cot_mode: CotMode, template: str, max_tokens: int, seed: int):
+def _litelm_model(
+    endpoint: ModelEndpoint,
+    replicas: Sequence[ModelEndpoint],
+    cot_mode: CotMode,
+    template: str,
+    max_tokens: int,
+    seed: int,
+    cache_dir: str | None = None,
+):
     from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
     from lighteval.models.model_input import GenerationParameters
 
@@ -193,6 +201,7 @@ def _litelm_model(endpoint: ModelEndpoint, replicas: Sequence[ModelEndpoint], co
         api_key=endpoint.api_key,
         concurrent_requests=sum(item.max_num_seqs for item in replicas),
         max_model_length=endpoint.ctx_len,
+        cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=5,
         generation_only=True,
         target_completions=4096,
@@ -461,6 +470,7 @@ async def evaluate(  # noqa: C901
                 _prompt_template(benchmark.selector, prompt_template),
                 max_generated_tokens,
                 seed,
+                cache_dir=str(Path(output_dir) / ".lighteval_cache"),
             )
             tracker = EvaluationTracker(
                 output_dir=output_dir,
