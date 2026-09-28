@@ -316,8 +316,15 @@ def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling
     truncated = total = 0
     for native in native_details:
         doc, response = native.doc, native.model_response
-        messages = response.input if isinstance(response.input, list) else [{"role": "user", "content": str(response.input or doc.query)}]
-        for index, answer in enumerate(response.final_text or [""]):
+        answers = [str(answer) for answer in (response.final_text or [])]
+        if not any(answer.strip() for answer in answers):
+            choices = getattr(doc, "choices", None) or []
+            logprobs = getattr(response, "logprobs", []) or []
+            if choices and len(logprobs) >= len(choices):
+                predicted = max(range(len(choices)), key=logprobs.__getitem__)
+                # Materialize the greedy choice for logit-only responses.
+                answers = [chr(ord("A") + predicted)]
+        for index, answer in enumerate(answers or [""]):
             finish_reason = response.finish_reasons[index] if index < len(response.finish_reasons) else "stop"
             is_truncated = finish_reason.lower() in {"length", "max_tokens"}
             truncated += int(is_truncated)
@@ -325,8 +332,14 @@ def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling
             detail_score = _native_detail_score(native)
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
+            messages = (
+                [dict(message) for message in response.input]
+                if isinstance(response.input, list)
+                else [{"role": "user", "content": str(response.input or doc.query)}]
+            )
+            messages.append({"role": "assistant", "content": str(answer)})
             detail = Detail(
-                messages=[dict(message) for message in messages],
+                messages=messages,
                 sampling_config=sampling,
                 answer=str(answer),
                 ground_truth=_ground_truth(doc),
@@ -453,16 +466,22 @@ async def evaluate(  # noqa: C901
         lightweight=test_mode,
     )
     sampling = _sampling_config(cot_mode, max_generated_tokens, seed)
-    successful: list[Score] = []
-    pending: list[tuple[Score, BenchmarkField, Path]] = []
     groups: dict[tuple[str, int], list[ModelEndpoint]] = {}
     for endpoint in models:
         groups.setdefault((endpoint.model_name, endpoint.ctx_len), []).append(endpoint)
 
-    for (model_name, ctx_len), replicas in groups.items():
-        LOGGER.info("evaluating model=%s replicas=%d", model_name, len(replicas))
-        for benchmark in benchmarks:
-            LOGGER.info("starting LightEval for benchmark=%s", benchmark.selector)
+    successful: list[Score] = []
+    pending: list[tuple[Score, BenchmarkField, Path]] = []
+    for benchmark in benchmarks:
+        pipelines = []
+        for (model_name, ctx_len), replicas in groups.items():
+            LOGGER.info(
+                "starting LightEval for model=%s benchmark=%s replicas=%d concurrent_requests=%d",
+                model_name,
+                benchmark.selector,
+                len(replicas),
+                sum(item.max_num_seqs for item in replicas),
+            )
             model_config = _litelm_model(
                 replicas[0],
                 replicas,
@@ -470,6 +489,8 @@ async def evaluate(  # noqa: C901
                 _prompt_template(benchmark.selector, prompt_template),
                 max_generated_tokens,
                 seed,
+                # SampleCache adds model name and model-config hash below this
+                # directory, so model groups never share response parquet files.
                 cache_dir=str(Path(output_dir) / ".lighteval_cache"),
             )
             tracker = EvaluationTracker(
@@ -484,22 +505,17 @@ async def evaluate(  # noqa: C901
                 load_tasks_multilingual=True,
                 streaming_evaluation=True,
             )
-            pipeline = await asyncio.to_thread(
-                Pipeline, benchmark.selector, params, tracker, model_config=model_config
+            pipelines.append(
+                await asyncio.to_thread(Pipeline, benchmark.selector, params, tracker, model_config=model_config)
             )
-            # Some native metrics use ``signal.SIGALRM`` for their timeout
-            # guard.  Running evaluation in ``asyncio.to_thread`` breaks
-            # those metrics because Python only permits signal handlers in
-            # the main thread.  LiteLLM is a synchronous model whose request
-            # pool already uses worker threads, so evaluate it on the main
-            # thread; retain the worker path for genuinely async models.
-            if getattr(getattr(pipeline, "model", None), "is_async", False):
-                await asyncio.to_thread(pipeline.evaluate)
-            else:
-                pipeline.evaluate()
+
+        # Evaluate one benchmark concurrently across independent model pools;
+        # the next benchmark starts only after this wave has been collected.
+        await asyncio.gather(*(asyncio.to_thread(pipeline.evaluate) for pipeline in pipelines))
+        for pipeline in pipelines:
             pipeline.show_results()
-            result = pipeline.get_results()
-            for public_task_name, metrics in result["results"].items():
+            rows: list[Score] = []
+            for public_task_name, metrics in pipeline.get_results()["results"].items():
                 if (
                     public_task_name == "all"
                     or ":_average:" in public_task_name
@@ -507,7 +523,26 @@ async def evaluate(  # noqa: C901
                 ):
                     continue
                 task_name = _internal_task_name(pipeline, public_task_name)
-                score = _make_score(pipeline, task_name, metrics, sampling)
+                rows.append(_make_score(pipeline, task_name, metrics, sampling))
+
+            # A selector that expands to multiple LightEval tasks is one
+            # benchmark in the external scoreboard.
+            if len(rows) > 1:
+                weights = [item.num_samples * item.avg_k for item in rows]
+                total_samples, total_completions = sum(item.num_samples for item in rows), sum(weights) or 1
+                aggregate = rows[0]
+                aggregate.benchmark_name, aggregate.num_samples = benchmark.selector, total_samples
+                aggregate.avg_k = total_completions / total_samples if total_samples else 0.0
+                aggregate.score = sum(item.score * weight for item, weight in zip(rows, weights)) / total_completions
+                aggregate.truncation_rate = sum(
+                    item.truncation_rate * weight for item, weight in zip(rows, weights)
+                ) / total_completions
+                details = [[detail for item in rows for detail in getattr(item, name)][:20] for name in (
+                    "passed_details", "wrong_details", "failed_details"
+                )]
+                aggregate.passed_details, aggregate.wrong_details, aggregate.failed_details = details
+                rows = [aggregate]
+            for score in rows:
                 successful.append(score)
                 score_path = _persist_score(
                     score,

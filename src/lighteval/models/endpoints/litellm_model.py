@@ -447,6 +447,12 @@ class LiteLLMClient(LightevalModel):
                 else [0.0 for _ in doc.choices]
             )
             response.output_tokens = [[] for _ in doc.choices]
+            if predicted is not None and not any(str(text).strip() for text in response.final_text):
+                # Logit-based answers otherwise have no assistant turn in
+                # details.  Materialize the greedy choice as the same A/B/C
+                # token exposed by the generated-choice prompt.
+                response.text = [chr(ord("A") + predicted)]
+                response.finish_reasons = ["stop"]
         return responses
 
     @staticmethod
