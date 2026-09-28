@@ -21,6 +21,7 @@
 # SOFTWARE.
 
 import os
+import threading
 
 
 def timeout(timeout_seconds: int = 10):  # noqa: C901
@@ -46,6 +47,12 @@ def timeout(timeout_seconds: int = 10):  # noqa: C901
                 raise TimeoutError("Operation timed out!")
 
             def wrapper(*args, **kwargs):
+                # ``signal`` can only be configured by the main thread. RWKV
+                # evaluates independent endpoint pools in worker threads, so
+                # run these short metric guards directly there instead of
+                # failing with ``ValueError: signal only works ...``.
+                if threading.current_thread() is not threading.main_thread():
+                    return func(*args, **kwargs)
                 old_handler = signal.getsignal(signal.SIGALRM)
                 signal.signal(signal.SIGALRM, handler)
                 signal.alarm(timeout_seconds)
