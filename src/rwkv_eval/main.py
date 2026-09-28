@@ -248,10 +248,28 @@ def _detail_score(task: Any, doc: Any, response: Any, index: int) -> float:
         if hasattr(scorer, "compute_score"):
             return _metric_value(scorer.compute_score(doc, sample))
         if hasattr(scorer, "compute"):
-            return _metric_value(scorer.compute(doc, sample))
+            try:
+                # Keyword arguments support both the native LightEval
+                # ``compute(doc, model_response)`` contract and metrics such
+                # as LiveCodeBench that declare the parameters in reverse.
+                return _metric_value(scorer.compute(doc=doc, model_response=sample))
+            except TypeError:
+                return _metric_value(scorer.compute(doc, sample))
         return _metric_value(metric.compute_sample(doc=doc, model_response=sample))
-    except (IndexError, KeyError, TypeError, ValueError):
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
         return 0.0
+
+
+def _native_detail_score(native: Any) -> float | None:
+    """Read a score already computed by LightEval for one retained detail."""
+    metric = getattr(native, "metric", None)
+    if not isinstance(metric, dict) or not metric:
+        return None
+    value = next(iter(metric.values()))
+    try:
+        return _metric_value(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _native_score(pipeline: Any, task_name: str, metrics: dict[str, Any]) -> float:
@@ -295,12 +313,15 @@ def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling
             is_truncated = finish_reason.lower() in {"length", "max_tokens"}
             truncated += int(is_truncated)
             total += 1
+            detail_score = _native_detail_score(native)
+            if detail_score is None:
+                detail_score = _detail_score(task, doc, response, index)
             detail = Detail(
                 messages=[dict(message) for message in messages],
                 sampling_config=sampling,
                 answer=str(answer),
                 ground_truth=_ground_truth(doc),
-                is_passed=not is_truncated and bool(str(answer).strip()) and _detail_score(task, doc, response, index) == 1.0,
+                is_passed=not is_truncated and bool(str(answer).strip()) and detail_score == 1.0,
             )
             bucket = failed if is_truncated or not str(answer).strip() else passed if detail.is_passed else wrong
             if len(bucket) < 20:
