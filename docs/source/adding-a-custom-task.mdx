@@ -160,3 +160,196 @@ lighteval accelerate \
     "myothertask|3" \
     --custom-tasks community_tasks/my_custom_task.py
 ```
+
+## Mandatory RWKV Benchmark Audit
+
+This section applies to the RWKV producer, including changes to existing
+benchmarks. It does not change the evaluation protocol for other LightEval
+models. Read it before editing task prompts, metrics, extraction, or publication.
+
+### 1. Record the benchmark contract before implementation
+
+Record the native benchmark reference and the existing LightEval prototype;
+selector and expanded subtasks; dataset revision, subset, split and sample/gold
+fields; `Doc.query`, `choices` and `gold_index`; few-shot behavior; metric name,
+aggregation and sample count; solver/scorer; NoCoT/FakeCoT/CoT decision; actual
+`SamplingMethod` and endpoint; template, stop/EOS behavior, context and effective
+token budget; output format, extraction failure and truncation definitions.
+A label or `generation_size` is not evidence of request routing.
+Obtain explicit user approval before any score-affecting change, including a
+bug fix, scoring-rule removal or cleanup that changes results. An explicit
+request for the specific change is approval; otherwise ask before editing.
+
+### 2. Keep RWKV policy private
+
+Follow `Registry._update_task_configs` and `Pipeline` as implementation
+prototypes. RWKV-only changes belong to `RWKVRegistry`/`RWKVPipeline` in
+`src/rwkv_eval/main.py`, using the registry's deep-copied configurations.
+Do not mutate `TASKS_TABLE`, metric singletons, native prompt functions, or
+process-wide registries. Shared optional response fields must have neutral
+defaults and survive indexing, caching and serialization. Demonstrate that a
+native task loaded before and after RWKV evaluation has unchanged behavior.
+
+### 3. Verify executable request behavior
+
+- NoCoT multiple-choice uses `LOGPROBS` and `/v1/completions`, with native
+  `multiple_choice(cache=True)`/`choice()` wiring where applicable. Multiple-token
+  candidates use the sum of conditional token logprobs, not perplexity.
+- Check the exact prefix and each candidate sent by the adapter. The selected
+  candidate input displayed in details must be a retained request string, not
+  choices reconstructed by the publisher. Continuation tasks such as ARC and
+  Winogrande do not send all alternatives in one prompt.
+- Generation uses `GENERATIVE` and `/v1/chat/completions`, with captured
+  server-rendered text. No rendered prompt means no publication. Reasoning must
+  not inherit an answer-only newline stop. Send the configured generated-token
+  budget unchanged; the backend's total context is configured independently.
+- Verify these facts in actual logs, including when resuming from cached output.
+
+### 4. Audit the answer lifecycle and grading
+
+Keep raw server output separate from metric input and concise uploaded answer.
+Use `answer_extractor_for_benchmark` and `extract_answer` in
+`src/rwkv_eval/answer_extract/free_response.py` for the same extraction contract.
+Math prefers balanced boxed expressions; choices yield a valid letter; code
+uses the final fenced program. Determine whether thinking is still open from
+the captured rendered prompt: a Fake Think wrapper may already close there,
+whereas an Open Think wrapper must close in the response. Fake Think may also
+split its closing tag across the actual boundary (`</think` in the prompt and
+`>` at the start of generation). Parse this captured boundary without changing
+either published string. An unterminated wrapper or extraction failure must
+not fall back to the reasoning trace.
+Keep extraction failure as `None` internally for grading, and serialize its
+uploaded answer as `"-"`. Preserve the raw assistant output, failure bucket and
+`is_passed=false`; never grade the display placeholder as an extracted answer.
+Validate dataset gold extraction before evaluation.
+
+Use the same individual comparator for native metrics and details. Preserve
+native `maj@n`, `pass@k` and `avg@n` aggregation, but never assign the aggregate
+score to every rollout. Compare concise math values with exact agreement first
+and the native mathematical-equivalence comparator next. Multiple accepted
+answers remain distinct alternatives; benchmark multi-part targets are not
+alternatives. For ASDiv, apply native unit removal to every semicolon-separated
+target and compare all parts in order. Named model values may be ordered only
+from the captured question, never selected using gold values. Preserve its
+textual targets with exact matching rather than interpreting names as algebra.
+For OlympiadBench, `is_multiple_answer` requires the whole comma-connected
+answer, not any single component. Ordinary extraction failure is not an
+output-limit truncation. Both live and parquet publication use `get_detail` in
+`src/rwkv_eval/upload.py`; no independent replay registry or grader is allowed.
+
+### Correction contracts: TruthfulQA, MATH and MATH-500
+
+- `truthfulqa:mc`: native prototype `truthful_qa_multiple_choice_prompt` and
+  `TruthfulqaMCMetrics.compute/mc1`; dataset `truthfulqa/truthful_qa`, subset
+  `multiple_choice`, split `validation`. `mc1_targets` and `mc2_targets` remain
+  separate groups within `Doc.choices`, with `specific.len_mc1` marking their
+  boundary. Keep both native metrics; the published first metric is MC1, so
+  its detail selects only MC1 candidates, displays the MC1 gold letter and
+  grades that choice. NoCoT remains `LOGPROBS` through `/v1/completions`, native
+  `multiple_choice(cache=True)`/`choice()`, with the retained selected request.
+  Do not display a merged MC1/MC2 distribution as the answer or use MC2's
+  probability as a Boolean pass flag. Native NumPy scalar metrics must remain
+  numeric when converting to publication values.
+- `math` expands to the native subject tasks; `math_500` is a single selector.
+  Prototypes are the native task formatters, `extract_math_answer` and
+  `MultilingualExtractiveMatchMetric`. Keep the native query, subject split,
+  sampled row IDs, complete gold and aggregation (including MATH's multiple
+  rollouts). CoT remains `GENERATIVE` through `/v1/chat/completions`, captured
+  `bot` prompts, no answer-only stop and a generated-token budget up to
+  24576, independent of prompt length. A closed response's concise expression may use `cot x` or LaTeX
+  `\\cot x`; normalize recognized function notation for extraction and
+  comparison. In prose fallback, preserve thousands-separated numerals and
+  exclude trailing `because`/`since` explanations rather than extracting
+  their last number. Preserve commas in intervals and multi-part expressions.
+  Failed extraction stays `None` internally and `"-"` in details; an unclosed
+  thinking trace remains failed even if it mentions the correct answer.
+
+### Approved RWKV expected-score restoration
+
+The user explicitly approved restoring the rule introduced in `59b3974f`.
+Prototypes: `ExactMatches.compute_one_item`, `PassAtK.pass_at_k` and the original
+RWKV missing-choice branches. `RWKVRegistry` installs private
+`RWKVExactMatches(choice=True)` and `RWKVPassAtK` on generative choice metrics;
+native metric singletons and non-RWKV registry copies remain unchanged.
+
+Affected registered selectors are GPQA `diamond`/`main` (and `extended` when
+selected): dataset `Idavidrein/gpqa`, matching native `gpqa_*` subset, `train`
+split. Keep native `Question` and three `Incorrect Answer *`/`Correct Answer`
+fields, shuffled displayed options, `Doc.query`, A–D `Doc.choices`, sampled row
+IDs and `gold_index`. CoT remains actual `GENERATIVE` through
+`/v1/chat/completions`, the captured `bot` template, no newline stop and a
+24576-generated-token budget. NoCoT `LOGPROBS` scoring is unchanged.
+
+An extracted correct letter scores 1, a wrong letter scores 0 and extraction
+failure scores 0.25. This restores the fixed historical value, not a new
+choice-count-dependent rule. For the historical pass@1 case with no score-1
+rollout, `n == len(scores)` and `missing > 0`, return `1 - 0.75**missing`;
+otherwise retain native aggregation. Main/extended retain their single-response
+aggregation; math and short-answer failures remain unchanged.
+
+Extraction failure remains `None` internally, empty only in native metric input,
+and `"-"` in publication. Raw output and the captured prompt are retained;
+failed or truncated details remain `is_passed=false` in the failure bucket.
+Fractional expected credit contributes to the score without fabricating a
+completed answer. Truncation accounting continues to use the actual finish
+reason. Validate native/RWKV/native isolation, mixed correct/wrong/missing
+rollouts and preserved failure details, then the required 1.5B/2.9B ten-question
+samples before publishing replacement scores; preserve old rows and exact
+request-budget evidence when regrading retained caches.
+
+### RWKV budget and completion-cache contract
+
+RWKV budgets such as 4096/8192/16384/24576 limit generated tokens, not total
+prompt plus completion length. Send the configured `max_new_tokens` unchanged,
+without subtracting prompt length or requiring an extra tokenization request.
+The inference backend's separately configured context is sufficiently large;
+manifest/weight context metadata is not a measured server context limit.
+Prototype: native OpenAI completion `max_tokens` and `usage.prompt_tokens`.
+Preserve the actual requested budget, server-reported prompt token count,
+rendered prompt and child seeds in `ModelResponse`, native caching and indexing.
+
+Prototype: `LiteLLMClient.__call_api_parallel`, `SampleCache`, and
+`EvaluationTracker.append_streaming_completion`. RWKV alone dispatches `n=1`
+HTTP rollouts, preserving native vLLM `ParentRequest` seed + child-index
+semantics. Harvest in completion order, append/fsync the native cache journal,
+then restore document/rollout order for metrics. Resume missing children from
+that journal; recover only an interrupted final line. Other LiteLLM providers
+retain their native batch request and caching behavior.
+
+Each producer detail records the actual requested generated-token budget.
+Scoreboard's single score-level sampling config records their maximum (the
+request ceiling); actual per-rollout budgets remain in saved producer
+details/cache, with the base parent seed in the shared sampling config and
+actual child seeds in the response. Legacy cached responses without request
+budget evidence may be regraded for corrections, but must not be represented
+as having newly verified budgets. Live acceptance checks the outgoing completion
+limit, captured rendered prompt, returned usage and finish reason; never
+reconstruct prompt evidence or invent request metadata.
+
+### 5. Regression and publication gate
+
+Before production publication, record results of:
+
+- hermetic request/prompt, stop/budget, nested-box, mathematical-equivalence,
+  invalid-choice, unclosed-think, failure-placeholder and multi-rollout tests;
+- native/RWKV/native task-isolation tests and both streaming/non-streaming batch
+  post-processing tests;
+- live/parquet detail equality and candidate-input cache/serialization tests;
+- interruption/resumption and streaming completed-output validation;
+- ten-question samples on both 1.5B and 2.9B, uploaded to the test dashboard,
+  with observed request types, modes, budgets and truncation rates;
+- dashboard inspection of correct, wrong and failed outputs where present,
+  separating model capability from extractor/grader faults. Do not require the
+  model to manufacture a failure; use controlled fixtures for missing categories.
+
+Acceptance requires actual scores and details in the test database for the
+required model/benchmark pairs. Query the previously reported abnormal answer,
+ground-truth, grading, prompt and mode patterns, and compare stored inputs with
+retained request evidence. Record score IDs, detail counts and anomaly counts.
+An empty result set, producer startup, or passing unit tests is not acceptance.
+
+Document unfinished checks as blockers, not successful validation. Obtain user
+confirmation before adding files. For corrections, preserve audit history and
+expire only exact affected score IDs after fetching a fresh manifest; never
+clear the database or rerun unrelated model/benchmark pairs. Do not change
+inference or Scoreboard implementation from this repository.

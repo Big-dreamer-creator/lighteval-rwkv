@@ -136,7 +136,49 @@ class SampleCache:
             except Exception as e:
                 logger.warning(f"Error loading cached indices from {cache_file}: {e}")
 
+        # RWKV HTTP rollouts append a durable journal before a whole batch
+        # returns. Other adapters never create these optional files.
+        for journal in cache_dir.rglob("*.jsonl"):
+            task_name, task_hash = journal.parts[-3:-1]
+            task_id = TaskID(task_name, task_hash, SamplingMethod[journal.stem])
+            indices = cached_indices.setdefault(task_id, [])
+            indices.extend(row["sample_id"] for row in self._load_sample_journal(journal.with_suffix(".parquet")))
+            cached_indices[task_id] = list(dict.fromkeys(indices))
         return cached_indices
+
+    def _load_sample_journal(self, cache_file: Path):
+        """Prototype: _load_sample and EvaluationTracker's completion JSONL.
+
+        A killed writer can leave an incomplete last line. Recover only that
+        tail; completed, fsynced records remain available for resumption.
+
+        Yields:
+            Completed sample records in append order.
+        """
+        journal = cache_file.with_suffix(".jsonl")
+        if not journal.exists():
+            return
+        with journal.open("r+b") as stream:
+            offset = 0
+            while line := stream.readline():
+                if not line.endswith(b"\n"):
+                    stream.truncate(offset)
+                    logger.warning("Discarded incomplete completion journal tail: %s", journal)
+                    break
+                offset = stream.tell()
+                yield json.loads(line)
+
+    def cache_sample(self, doc: Doc, result: ModelResponse, sampling_method: SamplingMethod):
+        """Durably append a completed HTTP rollout from the owning reader thread."""
+        task_id = self.get_task_id(doc.task_name, sampling_method)
+        journal = self.get_cache_path(task_id).with_suffix(".jsonl")
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        row = {"sample_id": doc.id, "sample": self._dump_sample(result)}
+        with journal.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.existing_indices.setdefault(task_id, []).append(doc.id)
 
     def get_model_hash(self, model_config: ModelConfig) -> str:
         """Create a hash for model configuration.
@@ -285,9 +327,16 @@ class SampleCache:
                 continue
             cache_file = self.get_cache_path(task_id)
             try:
-                dataset = load_dataset("parquet", data_files=str(cache_file), split="train")
-                dataset_df = dataset.to_pandas().set_index("sample_id")
-                task_datasets[task_id] = dataset_df
+                frames = []
+                if cache_file.exists():
+                    dataset = load_dataset("parquet", data_files=str(cache_file), split="train")
+                    frames.append(dataset.to_pandas().set_index("sample_id"))
+                wanted = {doc.id for doc in docs if self.get_task_id(doc.task_name, sampling_method) == task_id}
+                journal_rows = [row for row in self._load_sample_journal(cache_file) if row["sample_id"] in wanted]
+                if journal_rows:
+                    frames.append(pd.DataFrame(journal_rows).set_index("sample_id"))
+                dataset_df = pd.concat(frames)
+                task_datasets[task_id] = dataset_df[~dataset_df.index.duplicated(keep="first")]
             except Exception as e:
                 logger.warning(f"Error loading prediction cache for {str(task_id)}: {e}")
 
@@ -353,12 +402,21 @@ class SampleCache:
 
             # Save updated dataset
             dataset = Dataset.from_list(all_samples)
-            dataset.to_parquet(str(cache_file))
+            if cache_file.with_suffix(".jsonl").exists():
+                # The journal remains the recovery source if interruption
+                # occurs while compacting completed RWKV documents.
+                temporary = cache_file.with_suffix(".parquet.tmp")
+                dataset.to_parquet(str(temporary))
+                temporary.replace(cache_file)
+            else:
+                dataset.to_parquet(str(cache_file))
 
             logger.info(f"Cached {len(all_samples)} samples of {str(task_id)} at {str(cache_file)}.")
 
             # Refresh cached indices after storing new samples
-            self.existing_indices[task_id] = [sample["sample_id"] for sample in all_samples]
+            indices = [sample["sample_id"] for sample in all_samples]
+            indices.extend(row["sample_id"] for row in self._load_sample_journal(cache_file))
+            self.existing_indices[task_id] = list(dict.fromkeys(indices))
 
 
 def cached(sampling_method: SamplingMethod = None):  # noqa C901

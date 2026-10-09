@@ -121,6 +121,12 @@ class ModelResponse:
     # Model inputs
     input: str | list | None = None
     rendered_prompt: str | None = None
+    effective_max_new_tokens: int | None = None
+    prompt_token_count: int | None = None
+    # Native loglikelihood adapters may retain the exact candidate prompts sent
+    # to the endpoint.  Detail publishers must use these instead of rebuilding
+    # a prompt from Doc.query and Doc.choices.
+    candidate_inputs: list[str] = field(default_factory=list)
     input_tokens: list[int] = field(default_factory=list)
 
     # Model text outputs
@@ -139,6 +145,7 @@ class ModelResponse:
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
     finish_reasons: list[str] = field(default_factory=list)
+    seeds: list[int | None] = field(default_factory=list)
 
     @property
     def final_text(self) -> list[str]:
@@ -150,6 +157,9 @@ class ModelResponse:
         return ModelResponse(
             input=self.input,
             rendered_prompt=self.rendered_prompt,
+            effective_max_new_tokens=self.effective_max_new_tokens,
+            prompt_token_count=self.prompt_token_count,
+            candidate_inputs=self.candidate_inputs,
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             text_post_processed=[self.text_post_processed[index]] if self.text_post_processed else None,
@@ -160,6 +170,7 @@ class ModelResponse:
             unconditioned_logprobs=[self.unconditioned_logprobs[index]] if self.unconditioned_logprobs else None,
             reasonings=[self.reasonings[index]] if self.reasonings else [],
             finish_reasons=[self.finish_reasons[index]] if self.finish_reasons else [],
+            seeds=[self.seeds[index]] if self.seeds else [],
             truncated_tokens_count=self.truncated_tokens_count,
             padded_tokens_count=self.padded_tokens_count,
         )

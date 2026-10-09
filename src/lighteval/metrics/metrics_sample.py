@@ -266,11 +266,8 @@ class LoglikelihoodAcc(SampleLevelComputation):
             **kwargs: Additional keyword arguments.
 
         Returns:
-            float: The eval score, including 0.25 for an unextractable RWKV answer.
+            float: The eval score.
         """
-        if doc.specific and doc.specific.get("_rwkv_missing_answer"):
-            return 0.25
-
         n_choices = len(doc.choices)
         choices_logprobs = model_response.logprobs[:n_choices]
         unconditioned_logprobs = None
@@ -1276,7 +1273,6 @@ class PassAtK(SamplingMetric, SampleLevelComputation):
         self.k = k
         self.n = n
         self.attribute_must_be_set = ["k"]
-        self._rwkv_missing_fallback = False
 
     def compute(self, doc: Doc, model_response: ModelResponse, **kwargs) -> float:
         """Computes the metric over a list of golds and predictions for one single item with possibly many samples.
@@ -1296,7 +1292,6 @@ class PassAtK(SamplingMetric, SampleLevelComputation):
             raise Exception("Cannot compute pass@k with several golds")
 
         predictions = model_response.final_text
-        self._rwkv_missing_fallback = bool(doc.specific and doc.specific.get("_rwkv_choice_extractor"))
         if self.n is None:
             self.n = len(predictions)
             logger.warning("n undefined in the pass@k. We assume it's the same as the sample's number of predictions.")
@@ -1322,15 +1317,10 @@ class PassAtK(SamplingMetric, SampleLevelComputation):
         return self.pass_at_k(all_scores)
 
     def pass_at_k(self, all_scores: list[int]) -> float:
-        """Compute pass@k, with Albatross' missing-answer fallback for RWKV."""
+        """Compute the native pass@k estimator from individual scores."""
         c: int = all_scores.count(1)
         if self.n - c < self.k:
             return 1.0
-        if self._rwkv_missing_fallback and self.n and self.k == 1 and self.n == len(all_scores):
-            missing = all_scores.count(0.25)
-            if missing and c == 0:
-                return 1.0 - 0.75**missing
-
         return 1.0 - np.prod(1.0 - self.k / np.arange(self.n - c + 1, self.n + 1))
 
     def num_samples(self):

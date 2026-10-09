@@ -513,27 +513,10 @@ class Pipeline:
         logger.info("--- POST-PROCESSING MODEL RESPONSES ---")
 
         if self.pipeline_parameters.remove_reasoning_tags:
-            rwkv_generation = getattr(getattr(self.model, "config", None), "generation_only", False)
-            if rwkv_generation:
-                from src.rwkv_eval.answer_extract.free_response import (
-                    extract_code_answer,
-                    extract_free_response,
-                    extract_math_answer,
-                )
-
-            for _, responses in sampling_method_responses.items():
+            for responses in sampling_method_responses.values():
                 for response in responses:
                     response.text_post_processed = [
-                        extract_math_answer(text)
-                        if rwkv_generation and getattr(self.model.config, "rwkv_answer_extractor", None) == "math"
-                        else extract_code_answer(text)
-                        if rwkv_generation and getattr(self.model.config, "rwkv_answer_extractor", None) == "code"
-                        else extract_free_response(text)
-                        if rwkv_generation
-                        else remove_reasoning_tags(
-                            text=text,
-                            tag_pairs=self.pipeline_parameters.reasoning_tags,
-                        )
+                        remove_reasoning_tags(text=text, tag_pairs=self.pipeline_parameters.reasoning_tags)
                         for text in response.text
                     ]
 
@@ -634,6 +617,7 @@ class Pipeline:
         doc.fewshot_samples = []
         doc.images = None
         response.input = None
+        response.candidate_inputs.clear()
         response.text.clear()
         response.text_post_processed = []
         response.reasonings.clear()

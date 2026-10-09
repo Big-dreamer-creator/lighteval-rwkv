@@ -3,13 +3,21 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
 import httpx
 import pyarrow.parquet as pq
 
+from lighteval.models.model_output import ModelResponse
+from lighteval.tasks.requests import Doc
+from src.rwkv_eval.answer_extract.free_response import (
+    answer_extractor_for_benchmark,
+    extract_answer,
+    extract_math_answer,
+    verify_math_answer,
+)
 from src.rwkv_eval.configs import RwkvModel, SamplingConfig
 
 
@@ -76,6 +84,7 @@ def build_uploaded_messages(
     model_input: Any,
     answer: str,
     *,
+    assistant_message: str | None = None,
     fallback_query: Any = "",
     rendered_prompt: str | None = None,
 ) -> list[dict[str, str]]:
@@ -92,7 +101,7 @@ def build_uploaded_messages(
             messages = [{"role": "user", "content": _content_text(fallback_query)}]
     else:
         messages = [{"role": "user", "content": _content_text(model_input or fallback_query)}]
-    messages.append({"role": "assistant", "content": str(answer)})
+    messages.append({"role": "assistant", "content": str(answer if assistant_message is None else assistant_message)})
     return messages
 
 
@@ -201,7 +210,11 @@ def get_score(file_path: str | Path) -> Score:
         / date_id
         / f"details_{task_name}_{date_id}.parquet"
     )
-    passed, wrong, failed = get_eg_details(detail_path, no_cot=record.get("cot_mode") == "NoCoT")
+    passed, wrong, failed = get_eg_details(
+        detail_path,
+        no_cot=record.get("cot_mode") == "NoCoT",
+        task_name=task_name,
+    )
     return Score(
         _parse_stored_model(record),
         task_config["name"],
@@ -215,8 +228,108 @@ def get_score(file_path: str | Path) -> Score:
     )
 
 
-def get_eg_details(file_path: str | Path, *, no_cot: bool = False) -> tuple[list[Detail], list[Detail], list[Detail]]:
-    """Read up to 20 passed, wrong, and failed examples from one parquet file."""
+def _stored_metric_score(metric: Any) -> float:
+    # Prototype: main._native_score. Native grouped metrics retain their
+    # declared order, including NumPy boolean MC1 values before MC2 floats.
+    return float(next(iter(metric.values()), 0.0)) if isinstance(metric, dict) else 0.0
+
+
+def get_detail(  # noqa: C901
+    doc: Doc,
+    response: ModelResponse,
+    sampling: SamplingConfig,
+    metric: dict,
+    index: int,
+    *,
+    no_cot: bool,
+) -> tuple[Detail, int]:
+    """Prototype: get_eg_details, shared by live and persisted publication.
+
+    No prompt reconstruction and no aggregate-score-to-rollout conversion are
+    allowed here.  Raw assistant output is kept separately from the answer.
+    """
+    gold_indices = doc.gold_index if isinstance(doc.gold_index, list) else [doc.gold_index]
+    golds = [str(gold) for gold in doc.get_golds()]
+    extractor = answer_extractor_for_benchmark(doc.task_name)
+    if no_cot:
+        scores = response.logprobs[: len(doc.choices)]
+        if len(scores) != len(doc.choices) or len(response.candidate_inputs) != len(scores):
+            raise ValueError("NoCoT detail is missing the exact candidate inputs or scores")
+        # Prototype: TruthfulqaMCMetrics.compute/mc1. MC1 and MC2 are
+        # separate candidate groups, not one multiple-answer question. The
+        # published score is the first native metric (MC1); display its exact
+        # candidate and gold, while the pipeline still computes both metrics.
+        choice_count = (doc.specific or {}).get("len_mc1", len(scores))
+        gold_indices = [gold for gold in gold_indices if gold < choice_count]
+        selected = max(range(choice_count), key=scores.__getitem__)
+        model_input = response.candidate_inputs[selected]
+        answer = chr(ord("A") + selected)
+        ground_truth = ", ".join(chr(ord("A") + gold) for gold in gold_indices)
+        score = float(selected in gold_indices)
+        raw_answer = answer
+        rendered_prompt = None
+        finish = "stop"
+    else:
+        sampling = replace(
+            sampling,
+            max_generated_tokens=response.effective_max_new_tokens
+            if response.effective_max_new_tokens is not None
+            else sampling.max_generated_tokens,
+        )
+        raw_answer = response.text[index] if response.text else ""
+        answer = extract_answer(raw_answer, extractor, len(doc.choices), rendered_prompt=response.rendered_prompt)
+        if extractor in {"math", "short_answer"}:
+            golds = [gold if extractor == "short_answer" else extract_math_answer(gold) for gold in golds]
+            if any(gold is None for gold in golds):
+                raise ValueError("RWKV detail contains an unextractable gold answer")
+            score = float(
+                any(verify_math_answer(gold, answer or "", allow_text=extractor == "short_answer") for gold in golds)
+            )
+        elif extractor == "choice":
+            score = float(answer is not None and answer in golds)
+        else:
+            rollout_scores = (doc.specific or {}).get("rwkv_rollout_scores")
+            if rollout_scores is not None:
+                score = float(rollout_scores[index])
+            elif len(response.text) <= 1:
+                score = _stored_metric_score(metric)
+            else:
+                raise ValueError("RWKV detail is missing per-rollout scores")
+        ground_truth = golds[0] if len(golds) == 1 else json.dumps(golds, ensure_ascii=False)
+        rendered_prompt = rendered_prompt_from_response(response)
+        if rendered_prompt is None:
+            raise ValueError("generated detail is missing the server-rendered prompt")
+        model_input = response.input
+        finish = response.finish_reasons[index] if response.finish_reasons else "stop"
+    is_truncated = finish.lower() in {"length", "max_tokens"}
+    passed = not is_truncated and answer is not None and score == 1.0
+    bucket = 2 if is_truncated or answer is None else 0 if passed else 1
+    return Detail(
+        messages=build_uploaded_messages(
+            model_input,
+            answer or "",
+            assistant_message=raw_answer,
+            rendered_prompt=rendered_prompt,
+        ),
+        sampling_config=sampling,
+        answer=answer if answer is not None else "-",
+        ground_truth=ground_truth,
+        is_passed=passed,
+    ), bucket
+
+
+def get_eg_details(
+    file_path: str | Path,
+    *,
+    no_cot: bool = False,
+    task_name: str | None = None,
+) -> tuple[list[Detail], list[Detail], list[Detail]]:
+    """Read up to 20 details while preserving the stored model inputs.
+
+    NoCoT candidate inputs are produced by the loglikelihood adapter.  Older
+    parquet records without them cannot be safely reconstructed and are
+    rejected instead of receiving a synthetic prompt.
+    """
     path = Path(file_path)
     details_root = next(parent for parent in path.parents if parent.name == "details")
     sampling_path = (
@@ -228,61 +341,17 @@ def get_eg_details(file_path: str | Path, *, no_cot: bool = False) -> tuple[list
     sampling_config = get_sampling_config(sampling_path)
     buckets: tuple[list[Detail], list[Detail], list[Detail]] = ([], [], [])
     with pq.ParquetFile(path) as parquet_file:
-        for batch in parquet_file.iter_batches(batch_size=64, columns=["doc", "model_response"]):
+        for batch in parquet_file.iter_batches(batch_size=64, columns=["doc", "model_response", "metric"]):
             for row in batch.to_pylist():
-                doc, response, choices = row["doc"], row["model_response"], row["doc"]["choices"]
-                gold_indices = doc["gold_index"] if isinstance(doc["gold_index"], list) else [doc["gold_index"]]
-                golds = [
-                    gold
-                    for index in gold_indices
-                    for gold in (choices[index] if isinstance(choices[index], list) else [choices[index]])
-                ]
-                ground_truth = str(golds[0]) if len(golds) == 1 else json.dumps(golds, ensure_ascii=False)
-                rendered_prompt = rendered_prompt_from_response(response)
-                if not no_cot and rendered_prompt is None:
-                    raise ValueError("generated detail is missing the server-rendered prompt")
-                model_input = (
-                    doc.get("query", "")
-                    if no_cot and isinstance(response.get("input"), str)
-                    else response.get("input")
-                )
-                if no_cot and response.get("logprobs"):
-                    choice_scores = response["logprobs"][: len(choices)]
-                    predicted = max(range(len(choice_scores)), key=choice_scores.__getitem__)
-                    scores, answers, finishes = (
-                        [float(predicted in gold_indices)],
-                        [chr(ord("A") + predicted)],
-                        ["stop"],
-                    )
-                elif response["text"]:
-                    scores, answers, finishes = (
-                        doc["specific"]["rwkv_rollout_scores"],
-                        doc["specific"]["rwkv_rollout_extracted_answers"],
-                        response["finish_reasons"]
-                        or ["stop"] * len(doc["specific"]["rwkv_rollout_extracted_answers"]),
-                    )
-                else:
-                    choice_scores = response["logprobs"][: len(choices)]
-                    predicted = max(range(len(choice_scores)), key=choice_scores.__getitem__)
-                    scores, answers, finishes = [float(predicted in gold_indices)], [choices[predicted]], ["stop"]
-                for score, answer, finish in zip(scores, answers, finishes, strict=True):
-                    answer = str(answer)
-                    bucket = 2 if finish == "length" or not answer.strip() else int(score != 1)
+                doc = Doc(**row["doc"])
+                if task_name is not None:
+                    doc.task_name = task_name
+                response = ModelResponse(**row["model_response"])
+                count = 1 if no_cot else max(len(response.text), 1)
+                for index in range(count):
+                    detail, bucket = get_detail(doc, response, sampling_config, row["metric"], index, no_cot=no_cot)
                     if len(buckets[bucket]) < 20:
-                        buckets[bucket].append(
-                            Detail(
-                                build_uploaded_messages(
-                                    model_input,
-                                    answer,
-                                    fallback_query=doc.get("query", ""),
-                                    rendered_prompt=rendered_prompt,
-                                ),
-                                sampling_config,
-                                answer,
-                                ground_truth,
-                                bucket == 0,
-                            )
-                        )
+                        buckets[bucket].append(detail)
                 if all(len(bucket) == 20 for bucket in buckets):
                     return buckets
     return buckets
@@ -306,11 +375,24 @@ def upload(
 ) -> dict[str, Any]:
     """Register a score and upload it to Scoreboard."""
     details = score.passed_details + score.wrong_details + score.failed_details
-    sampling_config = sampling_config or (details[0].sampling_config if details else None)
+    # Scoreboard has one sampling config per score. Its budget is the
+    # ceiling across actual requests; each prompt-dependent value remains in
+    # the producer's detail/cache record, without changing message evidence.
+    sampling_config = sampling_config or (
+        replace(
+            details[0].sampling_config,
+            max_generated_tokens=max(detail.sampling_config.max_generated_tokens for detail in details),
+        )
+        if details
+        else None
+    )
     if sampling_config is None:
         raise ValueError("sampling_config is required when the score has no details")
-    if any(detail.sampling_config != sampling_config for detail in details):
-        raise ValueError("all details must use the uploaded sampling_config")
+    if any(
+        replace(detail.sampling_config, max_generated_tokens=sampling_config.max_generated_tokens) != sampling_config
+        for detail in details
+    ):
+        raise ValueError("all details must share decoding parameters apart from prompt-dependent budgets")
     payload = {
         "model": {**asdict(score.model), "data_version": score.model.data_version.capitalize()},
         "cot_mode": cot_mode,

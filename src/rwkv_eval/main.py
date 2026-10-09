@@ -23,21 +23,34 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
+import copy
 import json
 import logging
 import math
 import os
 import re
 import time
-from dataclasses import asdict
+from dataclasses import asdict, fields
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import httpx
 
-from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from lighteval.metrics.metrics_sample import ExactMatches, PassAtK, SamplingMetric
+from lighteval.pipeline import Pipeline
+from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
+from lighteval.tasks.registry import Registry
+from lighteval.tasks.requests import SamplingMethod
+from src.rwkv_eval.answer_extract.free_response import (
+    answer_extractor_for_benchmark,
+    extract_answer,
+    extract_math_answer,
+    verify_math_answer,
+)
 from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint, RwkvModel, SamplingConfig, read_benchmarks, read_models
-from src.rwkv_eval.upload import Detail, Score, build_uploaded_messages, rendered_prompt_from_response
+from src.rwkv_eval.upload import Score, get_detail
 from src.rwkv_eval.upload import upload as upload_score
 
 
@@ -45,8 +58,7 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_RETRIES = 6
 RETRY_DELAY = 1.0
 NORMAL_MAX_GENERATED_TOKENS = 4096
-HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 32768
-ENDPOINT_MAX_CONTEXT_LENGTH = 32768
+HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 24576
 TEST_MODE_MAX_SAMPLES = 10
 
 BenchmarkField = Literal[
@@ -116,6 +128,210 @@ def _auto_cot_mode(selector: str) -> tuple[CotMode, int]:
     return "CoT", NORMAL_MAX_GENERATED_TOKENS
 
 
+class RWKVExactMatches(ExactMatches):
+    """RWKV comparison, following ExactMatches.compute_one_item."""
+
+    def __init__(self, *, allow_text: bool = False, choice: bool = False):
+        super().__init__()
+        self.allow_text = allow_text
+        self.choice = choice
+
+    def compute_one_item(self, gold: str, pred: str) -> float:
+        if self.choice:
+            return super().compute_one_item(gold, pred) if pred else 0.25
+        return int(verify_math_answer(gold, pred, allow_text=self.allow_text))
+
+
+class RWKVPassAtK(PassAtK):
+    """PassAtK with the user-approved RWKV missing-choice expectation."""
+
+    def pass_at_k(self, all_scores: list[float]) -> float:
+        if self.n and self.k == 1 and self.n == len(all_scores) and all_scores.count(1) == 0:
+            missing = all_scores.count(0.25)
+            if missing:
+                return 1.0 - 0.75**missing
+        return super().pass_at_k(all_scores)
+
+
+def rwkv_prompt(line, task_name=None, *, prompt_function):
+    """Adapt a native prompt only for the RWKV registry's copied configs."""
+    doc = prompt_function(line, task_name)
+    if doc is None:
+        return None
+    extractor = answer_extractor_for_benchmark(task_name)
+    if extractor == "short_answer":
+        # Apply ASDiv's native unit removal to every answer, not only the
+        # first: its dataset uses semicolons for ordered multi-part targets.
+        doc.choices = ["; ".join(part.split(" (")[0].strip() for part in line["answer"].split(";"))]
+    if extractor in {"math", "short_answer"}:
+        # Dataset golds may be worked solutions or a list of accepted answers.
+        # Keep the native gold-index structure and normalize each alternative.
+        choices = [doc.choices] if isinstance(doc.choices, str) else doc.choices
+        doc.choices = [
+            [str(gold) if extractor == "short_answer" else extract_math_answer(str(gold)) for gold in choice]
+            if isinstance(choice, list)
+            else str(choice)
+            if extractor == "short_answer"
+            else extract_math_answer(str(choice))
+            for choice in choices
+        ]
+        if any(
+            choice is None or isinstance(choice, list) and any(gold is None for gold in choice)
+            for choice in doc.choices
+        ):
+            raise EvaluationError(f"RWKV task {task_name} has an unextractable gold answer")
+        if task_name.startswith("olympiad_bench:") and line["is_multiple_answer"]:
+            # OlympiadBench explicitly asks for all components, not any one
+            # accepted alternative. Keep its comma-connected answer contract.
+            doc.choices = [", ".join(choice) if isinstance(choice, list) else choice for choice in doc.choices]
+    elif _auto_cot_mode(task_name)[0] == "NoCoT":
+        if task_name == "commonsenseqa":
+            doc.query = doc.query.removeprefix(doc.instruction or "")
+            doc.instruction = ""
+        if doc.query.rstrip().endswith("Answer:"):
+            doc.query = doc.query.rstrip()[: -len("Answer:")].rstrip() + "\n"
+    return doc
+
+
+class RWKVLightevalTaskConfig(LightevalTaskConfig):
+    """Prototype: LightevalTaskConfig.__str__; stable RWKV cache identity."""
+
+    def __str__(self, lite: bool = False):
+        if lite:
+            config = copy.copy(self)
+            # Native formatting names individual callables. Solver lists and
+            # grouped corpus-function dictionaries must also be process-stable.
+            config.solver = [solver.__qualname__ for solver in self.solver] if self.solver else self.solver
+            return re.sub(r" at 0x[0-9a-fA-F]+(?=>)", "", LightevalTaskConfig.__str__(config, lite=True))
+        return super().__str__(lite=lite)
+
+
+class RWKVRegistry(Registry):
+    """Prototype: Registry._update_task_configs; changes stay in copied tasks."""
+
+    def _update_task_configs(self):
+        configs = super()._update_task_configs()
+        from inspect_ai.scorer import choice
+        from inspect_ai.solver import multiple_choice
+
+        from lighteval.metrics.metrics import Metrics
+
+        for task_configs in configs.values():
+            for index, original in enumerate(task_configs):
+                config = RWKVLightevalTaskConfig(
+                    **{field.name: getattr(original, field.name) for field in fields(original) if field.init}
+                )
+                task_configs[index] = config
+                config.prompt_function = partial(rwkv_prompt, prompt_function=config.prompt_function)
+                mode, _ = _auto_cot_mode(config.name)
+                if mode == "NoCoT":
+                    config.solver = [multiple_choice(cache=True)]
+                    config.scorer = choice()
+                    # Request routing is determined by metric category, not
+                    # solver metadata (e.g. native MMLU uses exact_match).
+                    if any(metric.category == SamplingMethod.GENERATIVE for metric in config.metrics):
+                        config.metrics = [copy.deepcopy(Metrics.loglikelihood_acc.value)]
+                elif answer_extractor_for_benchmark(config.name) in {"math", "short_answer", "choice"}:
+                    extractor = answer_extractor_for_benchmark(config.name)
+                    # Change only private generative comparators. Native
+                    # LOGPROBS and math aggregation retain their own behavior.
+                    for metric in config.metrics:
+                        if metric.category != SamplingMethod.GENERATIVE:
+                            continue
+                        comparator = RWKVExactMatches(
+                            allow_text=extractor == "short_answer", choice=extractor == "choice"
+                        )
+                        sample_fn = metric.sample_level_fn
+                        if extractor == "choice" and isinstance(sample_fn, PassAtK):
+                            metric.sample_level_fn = RWKVPassAtK(
+                                k=sample_fn.k,
+                                n=sample_fn.n,
+                                normalize=sample_fn.normalize,
+                                strip_strings=sample_fn.strip_strings,
+                                sample_scoring_function=comparator.compute,
+                            )
+                        elif isinstance(sample_fn, SamplingMetric):
+                            sample_fn.compute_score = comparator.compute
+                        else:
+                            metric.sample_level_fn = comparator
+        return configs
+
+
+class RWKVPipeline(Pipeline):
+    """Prototype: native Pipeline; RWKV task/output policy is isolated here."""
+
+    def _init_tasks_and_requests(self, tasks: str):
+        # Follow the native initialization order without monkeypatching Registry
+        # or altering TASKS_TABLE/metric singleton objects for other models.
+        self.registry = RWKVRegistry(
+            tasks=tasks,
+            load_multilingual=self.pipeline_parameters.load_tasks_multilingual,
+            custom_tasks=self.pipeline_parameters.custom_tasks_directory,
+        )
+        self.tasks_dict = self.registry.load_tasks()
+        self.documents_dict = {}
+        self.sampling_docs = collections.defaultdict(list)
+        if not self.pipeline_parameters.streaming_evaluation:
+            LightevalTask.load_datasets(self.tasks_dict, self.pipeline_parameters.dataset_loading_processes)
+            self._configure_sampling_counts()
+            self.documents_dict = {
+                task.full_name: task.get_docs(self.pipeline_parameters.max_samples)
+                for task in self.tasks_dict.values()
+            }
+            for docs in self.documents_dict.values():
+                for doc in docs:
+                    for sampling in doc.sampling_methods:
+                        self.sampling_docs[sampling].append(doc)
+        if self._metric_options:
+            self._update_num_samples(list(self.tasks_dict.values()))
+        self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
+
+    def _run_model_for_docs(self, sampling_docs):
+        outputs = super()._run_model_for_docs(sampling_docs)
+        for method, responses in outputs.items():
+            if method != SamplingMethod.GENERATIVE:
+                continue
+            # Use this batch's documents, not self.sampling_docs: streaming
+            # evaluation intentionally leaves the latter empty.
+            for doc, response in zip(sampling_docs[method], responses, strict=True):
+                extractor = answer_extractor_for_benchmark(doc.task_name)
+                response.text_post_processed = [
+                    extract_answer(text, extractor, len(doc.choices), rendered_prompt=response.rendered_prompt) or ""
+                    for text in response.text
+                ]
+        return outputs
+
+    def _post_process_outputs(self, sampling_method_responses):
+        # Already processed against the actual batch in _run_model_for_docs;
+        # raw responses and question-level aggregates stay separate.
+        for method, responses in sampling_method_responses.items():
+            if method != SamplingMethod.GENERATIVE:
+                continue
+            for response in responses:
+                if response.text_post_processed is None:
+                    raise EvaluationError("RWKV response is missing benchmark post-processing")
+
+    def _compute_metrics_for_sampling(self, sampling_docs, sampling_method_responses):
+        for method, responses in sampling_method_responses.items():
+            if method != SamplingMethod.GENERATIVE:
+                continue
+            for doc, response in zip(sampling_docs[method], responses, strict=True):
+                task = self.tasks_dict[doc.task_name]
+                if answer_extractor_for_benchmark(task.name) not in {"math", "short_answer", "choice"}:
+                    continue
+                sample_fn = task.metrics[0].sample_level_fn
+                comparator = sample_fn.compute_score if isinstance(sample_fn, SamplingMetric) else sample_fn.compute
+                if doc.specific is None:
+                    doc.specific = {}
+                # Per-rollout scores must not inherit a question's maj@n or
+                # pass@k aggregate.  Details and native aggregation share the
+                # same comparator and processed gold/prediction values.
+                doc.specific["rwkv_rollout_scores"] = [
+                    float(comparator(doc=doc, model_response=response[index])) for index in range(len(response.text))
+                ]
+        return super()._compute_metrics_for_sampling(sampling_docs, sampling_method_responses)
+
+
 def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingConfig:
     values = {
         "NoCoT": (0.0, 0, 1.0, 0.0, 0.0, 1.0),
@@ -137,7 +353,6 @@ def _litelm_model(
     max_tokens: int,
     seed: int,
     cache_dir: str | None = None,
-    answer_extractor: str | None = None,
 ):
     """Build the shared LiteLLM configuration for one RWKV endpoint pool."""
     from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
@@ -164,13 +379,12 @@ def _litelm_model(
         base_url=f"{endpoint.url.rstrip('/')}/v1",
         api_key=endpoint.api_key,
         concurrent_requests=sum(item.max_num_seqs for item in replicas),
-        max_model_length=max(endpoint.ctx_len, ENDPOINT_MAX_CONTEXT_LENGTH),
+        max_model_length=endpoint.ctx_len,
         scoreboard_ctx_len=endpoint.ctx_len,
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=6,
         extra_body=extra_body,
         generation_only=cot_mode != "NoCoT",
-        rwkv_answer_extractor=answer_extractor,
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
             top_k=sampling.top_k,
@@ -200,10 +414,8 @@ def _order_benchmarks(
     while keeping the test-mode startup bounded.
     """
     from lighteval.tasks.lighteval_task import LightevalTask
-    from lighteval.tasks.registry import Registry
-    from lighteval.tasks.requests import SamplingMethod
 
-    registry = Registry(tasks=",".join(spec.selector for spec in benchmarks), load_multilingual=True)
+    registry = RWKVRegistry(tasks=",".join(spec.selector for spec in benchmarks), load_multilingual=True)
     tasks = registry.load_tasks()
     estimates: dict[str, tuple[int, int]] = {}
     for spec in benchmarks:
@@ -290,70 +502,9 @@ def _metric_value(value: Any) -> float:
     return value if math.isfinite(value) else 0.0
 
 
-def _ground_truth(doc: Any) -> str:
-    golds = [str(gold) for gold in doc.get_golds()]
-    return golds[0] if len(golds) == 1 else str(golds)
-
-
-def _choice_indices(doc: Any) -> list[int]:
-    value = doc.gold_index
-    return [int(index) for index in value] if isinstance(value, (list, tuple)) else [int(value)]
-
-
-def _choice_distribution(choices: list[Any], logprobs: list[float], selected: int) -> str:
-    maximum = max(logprobs)
-    weights = [math.exp(value - maximum) for value in logprobs]
-    normalizer = sum(weights) or 1.0
-    payload = {
-        "selected": chr(ord("A") + selected),
-        "choices": [
-            {
-                "label": chr(ord("A") + index),
-                "logprob": float(logprob),
-                "probability": weights[index] / normalizer,
-            }
-            for index, logprob in enumerate(logprobs)
-        ],
-    }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-def _native_detail_score(native: Any) -> float | None:
-    metric = getattr(native, "metric", None)
-    if not isinstance(metric, dict) or not metric:
-        return None
-    return _metric_value(next(iter(metric.values())))
-
-
-def _native_score(pipeline: Any, task_name: str, metrics: dict[str, Any]) -> float:
-    del pipeline, task_name
+def _native_score(metrics: dict[str, Any]) -> float:
     values = [value for name, value in metrics.items() if not name.endswith("_stderr")]
     return _metric_value(values[0]) if values else 0.0
-
-
-def _detail_score(task: Any, doc: Any, response: Any, index: int) -> float:
-    metric = next(
-        (item for item in task.metrics if str(getattr(item.category, "value", item.category)) == "GENERATIVE"),
-        None,
-    ) or (task.metrics[0] if task.metrics else None)
-    if metric is None:
-        return 0.0
-    sample = response[index] if response.text and index < len(response.text) else response
-    scorer = metric.sample_level_fn
-    try:
-        if hasattr(scorer, "compute_score"):
-            return _metric_value(scorer.compute_score(doc, sample))
-        if hasattr(scorer, "compute"):
-            try:
-                # Keyword arguments support both the native LightEval
-                # ``compute(doc, model_response)`` contract and metrics such
-                # as LiveCodeBench that declare the parameters in reverse.
-                return _metric_value(scorer.compute(doc=doc, model_response=sample))
-            except TypeError:
-                return _metric_value(scorer.compute(doc, sample))
-        return _metric_value(metric.compute_sample(doc=doc, model_response=sample))
-    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-        return 0.0
 
 
 def _internal_task_name(pipeline: Any, public_task_name: str) -> str:
@@ -384,68 +535,20 @@ def _make_score(  # noqa: C901
     *,
     cot_mode: CotMode | None = None,
 ) -> Score:
-    task = pipeline.tasks_dict[task_name]
     native_details = pipeline.get_details().get(task_name, [])
-    passed, wrong, failed = [], [], []
+    buckets = ([], [], [])
     truncated = total = 0
     for native in native_details:
         doc, response = native.doc, native.model_response
-        ground_truth = _ground_truth(doc)
-        benchmark_name = task_name.split("|", 1)[0].split(":", 1)[0]
-        if benchmark_name in {"math", "math_500"}:
-            ground_truth = extract_math_answer(ground_truth)
-        answers = [str(answer) for answer in (response.final_text or [])]
-        choices = getattr(doc, "choices", None) or []
-        logprobs = getattr(response, "logprobs", []) or []
-        nocot_choice_score: float | None = None
-        if cot_mode == "NoCoT" and choices and len(logprobs) >= len(choices):
-            # NoCoT details expose the native choice distribution.  A
-            # multi-answer task such as TruthfulQA cannot be represented by a
-            # single greedy letter without hiding the behavior used by MC2.
-            if not (doc.specific or {}).get("_rwkv_missing_answer"):
-                predicted = max(range(len(choices)), key=logprobs.__getitem__)
-                gold_indices = _choice_indices(doc)
-                ground_truth = ", ".join(chr(ord("A") + index) for index in gold_indices)
-                if len(gold_indices) > 1:
-                    answers = [_choice_distribution(choices, logprobs[: len(choices)], predicted)]
-                else:
-                    answers = [chr(ord("A") + predicted)]
-                    nocot_choice_score = float(predicted in gold_indices)
-        elif not any(answer.strip() for answer in answers) and choices and len(logprobs) >= len(choices):
-            predicted = max(range(len(choices)), key=logprobs.__getitem__)
-            answers = [chr(ord("A") + predicted)]
-        for index, answer in enumerate(answers or [""]):
-            finish_reasons = response.finish_reasons or []
-            finish_reason = finish_reasons[index] if index < len(finish_reasons) else "stop"
-            is_truncated = finish_reason.lower() in {"length", "max_tokens"}
-            truncated += int(is_truncated)
+        count = 1 if cot_mode == "NoCoT" else max(len(response.text), 1)
+        for index in range(count):
+            detail, bucket = get_detail(doc, response, sampling, native.metric, index, no_cot=cot_mode == "NoCoT")
+            finish = response.finish_reasons[index] if index < len(response.finish_reasons) else "stop"
+            truncated += int(finish.lower() in {"length", "max_tokens"})
             total += 1
-
-            detail_score = nocot_choice_score
-            if detail_score is None:
-                detail_score = _native_detail_score(native)
-            if detail_score is None:
-                detail_score = _detail_score(task, doc, response, index)
-
-            rendered_prompt = None if cot_mode == "NoCoT" else rendered_prompt_from_response(response)
-            if cot_mode != "NoCoT" and rendered_prompt is None:
-                raise EvaluationError("RWKV generation response did not include the server-rendered prompt")
-            messages = build_uploaded_messages(
-                response.input,
-                str(answer),
-                fallback_query=doc.query,
-                rendered_prompt=rendered_prompt,
-            )
-            detail = Detail(
-                messages=messages,
-                sampling_config=sampling,
-                answer=str(answer),
-                ground_truth=ground_truth,
-                is_passed=not is_truncated and bool(str(answer).strip()) and detail_score == 1.0,
-            )
-            bucket = failed if is_truncated or not str(answer).strip() else passed if detail.is_passed else wrong
-            if len(bucket) < 20:
-                bucket.append(detail)
+            if len(buckets[bucket]) < 20:
+                buckets[bucket].append(detail)
+    passed, wrong, failed = buckets
 
     completions = pipeline.task_completion_counts.get(task_name, total)
     avg_k = 1.0 if cot_mode == "NoCoT" else pipeline.task_avg_k.get(task_name, 1)
@@ -459,7 +562,7 @@ def _make_score(  # noqa: C901
         benchmark_name=task_name.split("|", 1)[0],
         num_samples=pipeline.task_sample_counts.get(task_name, len(native_details)),
         avg_k=float(avg_k),
-        score=_native_score(pipeline, task_name, metrics),
+        score=_native_score(metrics),
         truncation_rate=pipeline.task_truncation_counts.get(task_name, truncated) / completions
         if completions
         else 0.0,
@@ -476,15 +579,6 @@ def _model_parts(name: str, ctx_len: int) -> tuple[str, str, str, int]:
     if not re.fullmatch(r"g1[a-z0-9]*", parts[1]) or parts[2] not in {"1.5b", "2.9b", "7.2b", "13.3b"}:
         raise ValueError(f"invalid RWKV model name: {name}")
     return parts[0], parts[1].capitalize(), parts[2], ctx_len
-
-
-def _field_for_task(task_name: str, benchmarks: Sequence[BenchmarkSpec]) -> BenchmarkField:
-    leaf = task_name.split("|", 1)[0]
-    for benchmark in benchmarks:
-        selector = benchmark.selector.rsplit("|", 1)[-1]
-        if leaf == selector or leaf.startswith(f"{selector}:"):
-            return benchmark.field
-    return benchmarks[0].field
 
 
 def _score_path(score: Score, output_dir: str) -> Path:
@@ -656,7 +750,7 @@ async def evaluate(  # noqa: C901
         return [], []
 
     from lighteval.logging.evaluation_tracker import EvaluationTracker
-    from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+    from lighteval.pipeline import ParallelismManager, PipelineParameters
 
     benchmarks = _order_benchmarks(
         benchmarks,
@@ -705,13 +799,6 @@ async def evaluate(  # noqa: C901
                 benchmark_max_tokens,
                 seed,
                 cache_dir=str(Path(output_dir) / ".lighteval_cache"),
-                answer_extractor=(
-                    "math"
-                    if _benchmark_matches(benchmark.selector, ("math", "math_500"))
-                    else "code"
-                    if _benchmark_matches(benchmark.selector, ("lcb",))
-                    else None
-                ),
             )
             tracker = EvaluationTracker(
                 output_dir=output_dir,
@@ -726,14 +813,13 @@ async def evaluate(  # noqa: C901
                 streaming_evaluation=True,
             )
             pipelines.append(
-                await asyncio.to_thread(Pipeline, benchmark.selector, params, tracker, model_config=model_config)
+                await asyncio.to_thread(RWKVPipeline, benchmark.selector, params, tracker, model_config=model_config)
             )
 
-        # Evaluate model pools one at a time so a transient endpoint failure
-        # cannot cancel a completed pool's cached rollouts or hide its score.
+        # Publish each completed pool before evaluating the next model, so
+        # another pool's error cannot hide already completed benchmark scores.
         for pipeline in pipelines:
             await asyncio.to_thread(pipeline.evaluate)
-        for pipeline in pipelines:
             pipeline.show_results()
             rows: list[Score] = []
             for public_task_name, metrics in pipeline.get_results()["results"].items():
