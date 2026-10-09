@@ -317,7 +317,12 @@ that journal; recover only an interrupted final line. RWKV `LOGPROBS` requests
 also append/fsync each completed document in completion order, preserving exact
 candidate inputs and summed sequence logprobs; failed peers do not discard those
 checkpoints, and resumption restores document order while requesting only missing
-documents. Prototype: the same RWKV completion journal and native `SampleCache`.
+documents. Count NoCoT admission capacity in candidate completion sequences,
+not documents: a document with many alternatives must not multiply the endpoint
+pool capacity. Refill released capacity immediately in completion order; a
+candidate batch larger than the configured pool occupies it alone. Native choice
+requests, candidate token sums and output ordering are unchanged. Prototype:
+the same RWKV completion journal and native `SampleCache`.
 Other LiteLLM providers retain their native batch request and caching behavior.
 
 RWKV model pools run in separate spawned processes, following the native dataset

@@ -709,15 +709,32 @@ class LiteLLMClient(LightevalModel):
             results = [None] * len(docs)
             errors = []
             with ThreadPoolExecutor(self.concurrent_requests) as executor:
-                jobs = {executor.submit(self._loglikelihood, doc): index for index, doc in enumerate(docs)}
-                for future in as_completed(jobs):
-                    index = jobs[future]
-                    try:
-                        response = future.result()
-                        self._cache.cache_sample(docs[index], response, SamplingMethod.LOGPROBS)
-                        results[index] = response
-                    except Exception as error:
-                        errors.append(error)
+                requests_to_process = iter(enumerate(docs))
+                next_doc = next(requests_to_process, None)
+                jobs = {}
+                in_flight = 0
+                while jobs or next_doc is not None:
+                    while next_doc is not None:
+                        index, doc = next_doc
+                        # One candidate is one backend completion sequence.
+                        # Oversized documents occupy the entire pool alone.
+                        weight = max(1, min(len(doc.choices), self.concurrent_requests))
+                        if in_flight + weight > self.concurrent_requests:
+                            break
+                        jobs[executor.submit(self._loglikelihood, doc)] = (index, weight)
+                        in_flight += weight
+                        next_doc = next(requests_to_process, None)
+                    for future in as_completed(jobs):
+                        index, weight = jobs.pop(future)
+                        in_flight -= weight
+                        try:
+                            response = future.result()
+                            self._cache.cache_sample(docs[index], response, SamplingMethod.LOGPROBS)
+                            results[index] = response
+                        except Exception as error:
+                            errors.append(error)
+                        # Refill immediately, not after a slow batch barrier.
+                        break
             if errors:
                 raise errors[0]
             return results

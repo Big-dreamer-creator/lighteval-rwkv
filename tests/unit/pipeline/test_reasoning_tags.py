@@ -673,6 +673,48 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual([response.logprobs for response in responses], [[-0.75, -0.75], [-0.75, -0.75]])
         self.assertEqual(responses[1].candidate_inputs, ["R first", "R second"])
 
+    def test_logprobs_pool_counts_candidate_sequences_not_documents(self):
+        import time
+        from threading import Barrier, Lock
+        from unittest.mock import Mock
+
+        from lighteval.models.endpoints.litellm_model import LiteLLMClient
+
+        model = LiteLLMClient.__new__(LiteLLMClient)
+        model.model, model.concurrent_requests, model._cache = "rwkv7-test", 8, Mock()
+        docs = [
+            Doc(query=str(i), choices=[str(c) for c in range(4 if i < 4 else 20)], gold_index=0, id=str(i))
+            for i in range(5)
+        ]
+        barrier, lock = Barrier(2), Lock()
+        active = 0
+        peak = 0
+
+        def score(doc):
+            nonlocal active, peak
+            weight = min(len(doc.choices), model.concurrent_requests)
+            with lock:
+                active += weight
+                peak = max(peak, active)
+                self.assertLessEqual(active, 8, "document concurrency exceeded backend sequence capacity")
+            if int(doc.id) < 2:
+                barrier.wait(3)
+                time.sleep(0.03)
+            with lock:
+                active -= weight
+            return ModelResponse(
+                input=doc.query,
+                logprobs=[-0.25] * len(doc.choices),
+                candidate_inputs=[doc.query + choice for choice in doc.choices],
+            )
+
+        with patch.object(model, "_loglikelihood", side_effect=score):
+            results = LiteLLMClient.loglikelihood.__wrapped__(model, docs)
+        self.assertEqual(peak, 8)
+        self.assertEqual([response.input for response in results], [doc.query for doc in docs])
+        self.assertEqual([len(response.logprobs) for response in results], [4, 4, 4, 4, 20])
+        self.assertEqual(model._cache.cache_sample.call_count, 5)
+
     def test_logprobs_transport_retries_preserve_request_and_timeout(self):
         from unittest.mock import Mock
 
@@ -749,7 +791,7 @@ class TestRWKVNonInterference(unittest.TestCase):
                 provider="openai",
                 base_url="https://example.test/v1",
                 cache_dir=directory,
-                concurrent_requests=2,
+                concurrent_requests=4,
                 max_model_length=16,
             )
             model = LiteLLMClient(config)
