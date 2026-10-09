@@ -612,6 +612,73 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual([response.logprobs for response in responses], [[-0.75, -0.75], [-0.75, -0.75]])
         self.assertEqual(responses[1].candidate_inputs, ["R first", "R second"])
 
+    def test_loglikelihood_journal_preserves_completed_peer_on_failure(self):
+        from threading import Event
+
+        from lighteval.models.endpoints.litellm_model import LiteLLMClient, LiteLLMModelConfig
+
+        saved = Event()
+        docs = [
+            Doc(query=name, choices=[" first", " second"], gold_index=0, id=name, task_name="arc:easy|0")
+            for name in ("slow", "fast")
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            config = LiteLLMModelConfig(
+                model_name="rwkv7-test",
+                provider="openai",
+                base_url="https://example.test/v1",
+                cache_dir=directory,
+                concurrent_requests=2,
+                max_model_length=16,
+            )
+            model = LiteLLMClient(config)
+            store = model._cache.cache_sample
+
+            def checkpoint(doc, response, method):
+                store(doc, response, method)
+                saved.set()
+
+            def score(doc):
+                if doc.id == "slow":
+                    self.assertTrue(saved.wait(3), "completed LOGPROBS was blocked by a slow peer")
+                    raise RuntimeError("interrupted logprob request")
+                return ModelResponse(
+                    input=doc.query,
+                    logprobs=[-0.25, -0.75],
+                    candidate_inputs=[doc.query + choice for choice in doc.choices],
+                )
+
+            with (
+                patch.object(model, "_loglikelihood", side_effect=score),
+                patch.object(
+                    model._cache,
+                    "cache_sample",
+                    side_effect=checkpoint,
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "interrupted logprob request"):
+                    model.loglikelihood(docs)
+            journal = next(Path(directory).rglob("LOGPROBS.jsonl"))
+            self.assertEqual([json.loads(line)["sample_id"] for line in journal.read_text().splitlines()], ["fast"])
+            resumed = LiteLLMClient(config)
+            calls = []
+
+            def complete(doc):
+                calls.append(doc.id)
+                return ModelResponse(
+                    input=doc.query,
+                    logprobs=[-0.25, -0.75],
+                    candidate_inputs=[doc.query + choice for choice in doc.choices],
+                )
+
+            with patch.object(resumed, "_loglikelihood", side_effect=complete):
+                results = resumed.loglikelihood(docs)
+            self.assertEqual(calls, ["slow"])
+            self.assertEqual([result.input for result in results], ["slow", "fast"])
+            self.assertEqual([result.logprobs for result in results], [[-0.25, -0.75], [-0.25, -0.75]])
+            with patch.object(LiteLLMClient, "_loglikelihood", side_effect=AssertionError("unexpected inference")):
+                self.assertEqual(LiteLLMClient(config).loglikelihood(docs), results)
+
     def test_task_cache_identity_is_stable(self):
         from src.rwkv_eval.main import RWKVRegistry
 

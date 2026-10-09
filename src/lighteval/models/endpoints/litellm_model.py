@@ -695,8 +695,25 @@ class LiteLLMClient(LightevalModel):
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
         """Score each choice with native prompt logprobs; never generate a fallback answer."""
-        # Follow __call_api_parallel: independent documents share the configured
-        # request concurrency, while executor.map preserves response/doc order.
+        # Prototype: _greedy_until_rwkv. Checkpoint each completed RWKV
+        # sequence score before a slow/failed peer; restore document order.
+        if self._cache is not None and self.model.startswith("rwkv7"):
+            results = [None] * len(docs)
+            errors = []
+            with ThreadPoolExecutor(self.concurrent_requests) as executor:
+                jobs = {executor.submit(self._loglikelihood, doc): index for index, doc in enumerate(docs)}
+                for future in as_completed(jobs):
+                    index = jobs[future]
+                    try:
+                        response = future.result()
+                        self._cache.cache_sample(docs[index], response, SamplingMethod.LOGPROBS)
+                        results[index] = response
+                    except Exception as error:
+                        errors.append(error)
+            if errors:
+                raise errors[0]
+            return results
+        # Native non-RWKV requests retain their existing batching behavior.
         with ThreadPoolExecutor(self.concurrent_requests) as executor:
             return list(executor.map(self._loglikelihood, docs))
 

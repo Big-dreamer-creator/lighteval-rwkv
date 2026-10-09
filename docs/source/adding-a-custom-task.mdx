@@ -313,8 +313,12 @@ Prototype: `LiteLLMClient.__call_api_parallel`, `SampleCache`, and
 HTTP rollouts, preserving native vLLM `ParentRequest` seed + child-index
 semantics. Harvest in completion order, append/fsync the native cache journal,
 then restore document/rollout order for metrics. Resume missing children from
-that journal; recover only an interrupted final line. Other LiteLLM providers
-retain their native batch request and caching behavior.
+that journal; recover only an interrupted final line. RWKV `LOGPROBS` requests
+also append/fsync each completed document in completion order, preserving exact
+candidate inputs and summed sequence logprobs; failed peers do not discard those
+checkpoints, and resumption restores document order while requesting only missing
+documents. Prototype: the same RWKV completion journal and native `SampleCache`.
+Other LiteLLM providers retain their native batch request and caching behavior.
 
 Each producer detail records the actual requested generated-token budget.
 Scoreboard's single score-level sampling config records their maximum (the
