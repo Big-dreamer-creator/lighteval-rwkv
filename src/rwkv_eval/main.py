@@ -385,6 +385,7 @@ def _litelm_model(
         scoreboard_ctx_len=endpoint.ctx_len,
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=6,
+        timeout=14400.0,
         extra_body=extra_body,
         generation_only=cot_mode != "NoCoT",
         generation_parameters=GenerationParameters(

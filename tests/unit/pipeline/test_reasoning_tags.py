@@ -673,6 +673,66 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual([response.logprobs for response in responses], [[-0.75, -0.75], [-0.75, -0.75]])
         self.assertEqual(responses[1].candidate_inputs, ["R first", "R second"])
 
+    def test_logprobs_transport_retries_preserve_request_and_timeout(self):
+        from unittest.mock import Mock
+
+        import requests
+
+        from lighteval.models.endpoints.litellm_model import LiteLLMClient
+        from src.rwkv_eval.configs import ModelEndpoint
+        from src.rwkv_eval.main import _litelm_model
+
+        endpoint = ModelEndpoint("https://vllm.rwkvos.com", "fixture", "rwkv7-g1k-1.5b", 1024, 32768)
+        config = _litelm_model(endpoint, [endpoint], "NoCoT", None, 4096, 42)
+        self.assertEqual(config.timeout, 14400)
+        model = LiteLLMClient.__new__(LiteLLMClient)
+        model.model, model.base_url, model.api_key, model.timeout = (
+            endpoint.model_name,
+            config.base_url,
+            "fixture",
+            config.timeout,
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = {"choices": [{"prompt_token_ids": [1], "prompt_logprobs": [None]}]}
+        unavailable = Mock(status_code=503)
+        errors = [requests.exceptions.SSLError("EOF"), requests.exceptions.ReadTimeout("slow peer"), unavailable]
+        with (
+            patch("lighteval.models.endpoints.litellm_model.requests.post", side_effect=errors + [response]) as post,
+            patch(
+                "lighteval.models.endpoints.litellm_model.time.sleep",
+            ) as sleep,
+        ):
+            result = model._prompt_logprobs_request("retained prefix", top_logprobs=1)
+        self.assertEqual(result, response.json.return_value["choices"])
+        self.assertEqual(post.call_count, 4)
+        for call in post.call_args_list:
+            self.assertEqual(call.kwargs["timeout"], 14400)
+            self.assertEqual(call.args[0], "https://vllm.rwkvos.com/v1/completions")
+            self.assertEqual(
+                call.kwargs["json"],
+                {
+                    "model": endpoint.model_name,
+                    "prompt": "retained prefix",
+                    "max_tokens": 0,
+                    "echo": True,
+                    "prompt_logprobs": 1,
+                    "return_token_ids": True,
+                },
+            )
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4])
+        with (
+            patch(
+                "lighteval.models.endpoints.litellm_model.requests.post",
+                side_effect=requests.exceptions.SSLError("EOF"),
+            ) as post,
+            patch(
+                "lighteval.models.endpoints.litellm_model.time.sleep",
+            ),
+        ):
+            with self.assertRaises(requests.exceptions.SSLError):
+                model._prompt_logprobs_request("retained prefix", top_logprobs=1)
+        self.assertEqual(post.call_count, 6)
+
     def test_loglikelihood_journal_preserves_completed_peer_on_failure(self):
         from threading import Event
 

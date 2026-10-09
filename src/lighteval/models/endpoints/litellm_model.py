@@ -643,15 +643,23 @@ class LiteLLMClient(LightevalModel):
             "prompt_logprobs": top_logprobs,
             "return_token_ids": True,
         }
+        # Prototype: __call_api. Retry transient transport failures as well
+        # as upstream 5xx, without changing the scoring request or its budget.
         for attempt in range(6):
-            response = requests.post(
-                request_url,
-                headers=request_headers,
-                json=request_body,
-                timeout=self.timeout or 120.0,
-            )
-            if response.status_code < 500 or attempt == 5:
-                break
+            try:
+                response = requests.post(
+                    request_url,
+                    headers=request_headers,
+                    json=request_body,
+                    timeout=self.timeout or 120.0,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                if attempt == 5:
+                    raise
+                logger.warning("RWKV LOGPROBS transport retry: model=%s attempt=%d", self.model, attempt + 1)
+            else:
+                if response.status_code < 500 or attempt == 5:
+                    break
             time.sleep(min(2**attempt, 16))
         response.raise_for_status()
         payload = response.json()

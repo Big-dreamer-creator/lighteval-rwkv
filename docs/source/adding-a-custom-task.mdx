@@ -326,8 +326,13 @@ state, grader and publication; neither serial models nor a cross-model benchmark
 barrier may idle the other pools. Production uses one transient producer unit per
 model so retries/resumption are independent. Measure running/waiting requests and
 token-rate deltas for all four pools at `https://vllm.rwkvos.com/metrics?model=...`;
-configured request limits alone do not establish inference saturation. Prompt,
-metric, sampling count and generated-token budgets remain benchmark-native.
+configured request limits alone do not establish inference saturation. Both RWKV
+LOGPROBS and generation use an explicit 14400-second HTTP request timeout;
+LOGPROBS retries transient TLS/connection/read failures and upstream 5xx at most
+six times, following the native generation retry prototype. Retries preserve the
+exact original request, candidate span and token budget, and never fabricate a
+response. Prompt, metric, sampling count and generated-token budgets remain
+benchmark-native.
 
 Each producer detail records the actual requested generated-token budget.
 Scoreboard's single score-level sampling config records their maximum (the
