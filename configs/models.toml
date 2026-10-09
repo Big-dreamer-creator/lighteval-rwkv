@@ -1,26 +1,26 @@
 [[model]]
-url = "api.rwkv.rs"
+url = "vllm.rwkvos.com"
 api_key = "${RWKV_INFERENCE_API_KEY}"
 model_name = "rwkv7-g1k-1.5b"
 max_num_seqs = 1024
 ctx_len = 32768
 
 [[model]]
-url = "api.rwkv.rs"
+url = "vllm.rwkvos.com"
 api_key = "${RWKV_INFERENCE_API_KEY}"
 model_name = "rwkv7-g1k-2.9b"
 max_num_seqs = 1024
 ctx_len = 32768
 
 [[model]]
-url = "api.rwkv.rs"
+url = "vllm.rwkvos.com"
 api_key = "${RWKV_INFERENCE_API_KEY}"
 model_name = "rwkv7-g1k-7.2b"
 max_num_seqs = 512
 ctx_len = 32768
 
 [[model]]
-url = "api.rwkv.rs"
+url = "vllm.rwkvos.com"
 api_key = "${RWKV_INFERENCE_API_KEY}"
 model_name = "rwkv7-g1k-13.3b"
 max_num_seqs = 1280

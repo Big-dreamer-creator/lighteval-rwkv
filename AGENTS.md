@@ -78,7 +78,7 @@ param_size: parameter scale, only includes 0.1b, 0.4b, 1.5b (often used in RL), 
 
 ## Throughput Checks
 1. VRAM headroom should be less than 10% of the total, and GPU utilization should reach 97%. If transformers-rwkv or FlashRWKV2 has performance issues, report to the user promptly.
-2. Use HTTP protocol to support communication between the evaluation side and the inference side. Request concurrency should be slightly greater than inference concurrency (a small amount of queuing is allowed, but idling is prohibited).
+2. Use HTTP protocol to support communication between the evaluation side and the inference side. Request concurrency should be slightly greater than inference concurrency (a small amount of queuing is allowed, but idling is prohibited). All four model pools must run concurrently in independent processes with independent benchmark queues and failure/resumption; never evaluate models serially or impose a cross-model benchmark barrier. Production transient units must restart each model pool independently. Verify actual running/waiting requests and token-throughput deltas for every pool; configured concurrency or a running producer alone is not evidence that inference is saturated.
 3. Refer to the evaluation methodology widely used by the community for this benchmark, and ensure that the appropriate interface is used (`/v1/completions`, `/v1/chat/completions`), along with the thinking intensity (NoCoT, FakeCoT, CoT) and prompt templates (`Question: ... Answer:; User: ... Assistant: <think; etc.`).
 
 ## End-to-End Testing
@@ -108,7 +108,7 @@ Use uv to manage the local and remote dedicated environment ./.venv. This projec
 If need to clear the database, ssh rwkv-rs-server.
 
 ## Inference API
-url: api.rwkv.rs
+url: vllm.rwkvos.com
 1.5B: bsz1024
 2.9B: bsz1024
 7.2B: bsz512

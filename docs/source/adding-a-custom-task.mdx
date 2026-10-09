@@ -320,6 +320,15 @@ checkpoints, and resumption restores document order while requesting only missin
 documents. Prototype: the same RWKV completion journal and native `SampleCache`.
 Other LiteLLM providers retain their native batch request and caching behavior.
 
+RWKV model pools run in separate spawned processes, following the native dataset
+process-worker prototype. Each pool owns its full benchmark queue, native random
+state, grader and publication; neither serial models nor a cross-model benchmark
+barrier may idle the other pools. Production uses one transient producer unit per
+model so retries/resumption are independent. Measure running/waiting requests and
+token-rate deltas for all four pools at `https://vllm.rwkvos.com/metrics?model=...`;
+configured request limits alone do not establish inference saturation. Prompt,
+metric, sampling count and generated-token budgets remain benchmark-native.
+
 Each producer detail records the actual requested generated-token budget.
 Scoreboard's single score-level sampling config records their maximum (the
 request ceiling); actual per-rollout budgets remain in saved producer

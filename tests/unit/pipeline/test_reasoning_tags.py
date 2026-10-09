@@ -418,6 +418,67 @@ class TestPipelineReasoningTags(unittest.TestCase):
 class TestRWKVNonInterference(unittest.TestCase):
     """Prototype: TestPipelineReasoningTags; no endpoints or datasets needed."""
 
+    def test_model_pools_have_independent_concurrent_benchmark_queues(self):
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier, Event
+
+        from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint
+        from src.rwkv_eval.main import evaluate
+
+        models = [
+            ModelEndpoint("https://vllm.rwkvos.com", "fixture", f"rwkv7-g1k-{size}", slots, 32768)
+            for size, slots in (("1.5b", 1024), ("2.9b", 1024), ("7.2b", 512), ("13.3b", 1280))
+        ]
+        benchmarks = [BenchmarkSpec("knowledge", "arc:easy"), BenchmarkSpec("knowledge", "mmlu")]
+        for fail in (False, True):
+            with self.subTest(failed_pool=fail):
+                started = Barrier(4)
+                advanced = Event()
+                completed = []
+
+                def executor(max_workers, mp_context):
+                    self.assertEqual(max_workers, 4)
+                    self.assertEqual(mp_context.get_start_method(), "spawn")
+                    return ThreadPoolExecutor(max_workers=max_workers)
+
+                def worker(replicas, tasks, options, log_level):
+                    self.assertEqual(len(replicas), 1)
+                    self.assertEqual(tasks, benchmarks)
+                    self.assertEqual(options["max_samples"], None)
+                    self.assertFalse(options["test_mode"])
+                    self.assertEqual(options["seed"], 42)
+                    self.assertEqual(options["output_dir"], "/fixture/results")
+                    started.wait(3)
+                    name = replicas[0].model_name
+                    if name.endswith("13.3b"):
+                        self.assertTrue(advanced.wait(3), "fast pool cannot advance independently")
+                        if fail:
+                            raise RuntimeError("failed model pool")
+                    else:
+                        for task in tasks:
+                            completed.append((name, task.selector))
+                        advanced.set()
+                    return [name], []
+
+                with (
+                    patch("src.rwkv_eval.main.ProcessPoolExecutor", side_effect=executor),
+                    patch(
+                        "src.rwkv_eval.main._evaluate_pool",
+                        side_effect=worker,
+                    ),
+                ):
+                    run = evaluate(models, benchmarks, no_upload=True, output_dir="/fixture/results")
+                    if fail:
+                        with self.assertRaisesRegex(RuntimeError, "failed model pool"):
+                            asyncio.run(run)
+                    else:
+                        scores, failures = asyncio.run(run)
+                        self.assertEqual(scores, [model.model_name for model in models])
+                        self.assertEqual(failures, [])
+                self.assertEqual(len(completed), 6)
+                self.assertIn((models[0].model_name, "mmlu"), completed)
+
     def test_registry_changes_are_private(self):
         from lighteval.tasks.tasks.arc import arc_easy
         from lighteval.tasks.tasks.commonsenseqa import commonsenseqa

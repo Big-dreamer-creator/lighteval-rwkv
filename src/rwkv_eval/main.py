@@ -31,8 +31,10 @@ import math
 import os
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, fields
 from functools import partial
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
@@ -633,6 +635,15 @@ async def _upload(score: Score, field: BenchmarkField, cot_mode: CotMode, token:
     raise EvaluationError(f"score upload failed after {REQUEST_RETRIES} attempts") from last_error
 
 
+def _evaluate_pool(
+    models: Sequence[ModelEndpoint], benchmarks: Sequence[BenchmarkSpec], options: dict[str, Any], log_level: int
+) -> tuple[list[Score], list[Score]]:
+    # Prototype: LightevalTask.load_datasets process workers. Native Pipeline
+    # seeds, task formatters and graders must not share state across pools.
+    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s")
+    return asyncio.run(evaluate(models, benchmarks, **options))
+
+
 async def evaluate(  # noqa: C901
     models: Sequence[ModelEndpoint],
     benchmarks: Sequence[BenchmarkSpec],
@@ -674,6 +685,36 @@ async def evaluate(  # noqa: C901
             model[1].casefold(),
             model[2].casefold(),
             model[3],
+        )
+
+    if len(groups) > 1:
+        options = {
+            "prompt_template": prompt_template,
+            "max_samples": max_samples,
+            "test_mode": test_mode,
+            "seed": seed,
+            "scoreboard_token": scoreboard_token,
+            "scoreboard_url": scoreboard_url,
+            "no_upload": no_upload,
+            "output_dir": output_dir,
+        }
+        loop = asyncio.get_running_loop()
+        # Each process owns its entire benchmark queue, not one benchmark at
+        # a time: fast pools never wait at a slow pool's benchmark barrier.
+        with ProcessPoolExecutor(max_workers=len(groups), mp_context=get_context("spawn")) as executor:
+            jobs = [
+                loop.run_in_executor(
+                    executor, _evaluate_pool, replicas, benchmarks, options, logging.getLogger().getEffectiveLevel()
+                )
+                for replicas in groups.values()
+            ]
+            results = await asyncio.gather(*jobs, return_exceptions=True)
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise errors[0]
+        return (
+            [score for scores, _ in results for score in scores],
+            [score for _, failures in results for score in failures],
         )
 
     if no_upload:
@@ -816,8 +857,8 @@ async def evaluate(  # noqa: C901
                 await asyncio.to_thread(RWKVPipeline, benchmark.selector, params, tracker, model_config=model_config)
             )
 
-        # Publish each completed pool before evaluating the next model, so
-        # another pool's error cannot hide already completed benchmark scores.
+        # This worker owns one model pool; publish each completed benchmark
+        # immediately, independently of the other model processes.
         for pipeline in pipelines:
             await asyncio.to_thread(pipeline.evaluate)
             pipeline.show_results()
