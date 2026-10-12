@@ -500,11 +500,162 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual(native_mmlu.sampling_methods, [SamplingMethod.GENERATIVE])
         for name, config in originals.items():
             self.assertIsNot(config, rwkv[name + "|0"].config)
+            self.assertEqual(rwkv[name + "|0"].config.version, config.version + (name != "math_500"))
             self.assertIsNot(config.metrics[0].sample_level_fn, rwkv[name + "|0"].metrics[0].sample_level_fn)
             self.assertEqual(config.metrics[0].sample_level_fn.__dict__, baseline[name])
         sample = {"question": "Q?", "choices": {"text": ["first", "second"], "label": ["A", "B"]}, "answerKey": "B"}
         self.assertTrue(arc_easy.prompt_function(sample).query.endswith("Answer:"))
-        self.assertFalse(rwkv["arc:easy|0"].formatter(sample, "arc:easy").query.endswith("Answer:"))
+        self.assertEqual(
+            rwkv["arc:easy|0"].formatter(sample, "arc:easy").query, arc_easy.prompt_function(sample).query
+        )
+
+    def test_rwkv_answer_cue_follows_request_mode(self):
+        from src.rwkv_eval.main import _NO_COT_BENCHMARKS, rwkv_prompt
+
+        query = "Question: What is 2 + 2?\nA. 3\nB. 4\nAnswer: "
+        for task_name in (*_NO_COT_BENCHMARKS, "arc:easy", "mmlu:anatomy"):
+            for suffix in ("", " ", "\n", " \n"):
+                existing = query.rstrip() + suffix
+                with self.subTest(task_name=task_name, suffix=suffix):
+                    doc = rwkv_prompt(
+                        {},
+                        task_name,
+                        prompt_function=lambda line, name: Doc(query=existing, choices=["A", "B"], gold_index=1),
+                    )
+                    self.assertEqual(doc.query, existing)
+                    self.assertEqual(doc.choices, ["A", "B"])
+                    self.assertEqual(doc.gold_index, 1)
+
+            for original in (
+                "Question: What is 2 + 2?\nA. 3\nB. 4",
+                "Question: Explain the label Answer: inside this question. ",
+                "Question: Q? Answer: ",
+                "Question: Q?\n答案：",
+            ):
+                with self.subTest(task_name=task_name, original=original):
+                    doc = rwkv_prompt(
+                        {},
+                        task_name,
+                        prompt_function=lambda line, name: Doc(query=original, choices=["A", "B"], gold_index=1),
+                    )
+                    expected = original.rstrip()
+                    if expected.endswith("Answer:"):
+                        expected = expected[: -len("Answer:")].rstrip()
+                    self.assertEqual(doc.query, expected + "\nAnswer: ")
+                    self.assertEqual(doc.choices, ["A", "B"])
+                    self.assertEqual(doc.gold_index, 1)
+                    again = rwkv_prompt({}, task_name, prompt_function=lambda line, name: doc)
+                    self.assertEqual(again.query, expected + "\nAnswer: ")
+
+        for task_name in ("gsm8k", "arithmetic:2da"):
+            with self.subTest(task_name=task_name):
+                doc = rwkv_prompt(
+                    {}, task_name, prompt_function=lambda line, name: Doc(query=query, choices=["4"], gold_index=0)
+                )
+                self.assertEqual(doc.query, query.rstrip()[: -len("Answer:")].rstrip() + "\n")
+                self.assertEqual(doc.choices, ["4"])
+                self.assertEqual(doc.gold_index, 0)
+        unchanged = "Question: Explain the label Answer: inside this question."
+        doc = rwkv_prompt(
+            {}, "gsm8k", prompt_function=lambda line, name: Doc(query=unchanged, choices=["4"], gold_index=0)
+        )
+        self.assertEqual(doc.query, unchanged)
+
+    def test_rwkv_split_ids_are_private_and_preserve_documents(self):
+        from src.rwkv_eval.main import RWKVRegistry
+
+        config = LightevalTaskConfig(
+            name="openbookqa",
+            prompt_function=lambda line, name: Doc(
+                task_name=name, query=line["query"], choices=["A", "B"], gold_index=line["gold"]
+            ),
+            hf_repo="fixture",
+            hf_subset="default",
+            hf_avail_splits=["validation", "test"],
+            evaluation_splits=["validation", "test"],
+            metrics=[Metrics.loglikelihood_acc],
+        )
+        dataset = {
+            "validation": [{"query": "Validation question\nAnswer: ", "gold": 1}],
+            "test": [{"query": "Test question\nAnswer: ", "gold": 0}],
+        }
+        with patch.object(Registry, "load_all_task_configs", return_value={config.name: config}):
+            native_before = Registry(tasks="openbookqa").load_tasks()["openbookqa|0"]
+            rwkv = RWKVRegistry(tasks="openbookqa").load_tasks()["openbookqa|0"]
+            native_after = Registry(tasks="openbookqa").load_tasks()["openbookqa|0"]
+        for task in (native_before, rwkv, native_after):
+            task.dataset = copy.deepcopy(dataset)
+        native_docs = native_before._get_docs_from_split(["validation", "test"])
+        rwkv_docs = rwkv._get_docs_from_split(["validation", "test"])
+        self.assertEqual([doc.id for doc in native_docs], ["0", "0"])
+        self.assertEqual([doc.id for doc in rwkv_docs], ["validation:0", "test:0"])
+        for native, private in zip(native_docs, rwkv_docs, strict=True):
+            expected = asdict(native)
+            expected["id"] = private.id
+            self.assertEqual(asdict(private), expected)
+        self.assertEqual([doc.id for doc in native_after._get_docs_from_split(["validation", "test"])], ["0", "0"])
+        self.assertEqual(
+            [doc.id for doc in rwkv._get_docs_from_split(["validation", "test"], few_shots=True)], ["0", "0"]
+        )
+        rwkv.evaluation_split = ["test"]
+        self.assertEqual([doc.id for doc in rwkv._get_docs_from_split(["test"])], ["0"])
+
+    def test_rwkv_split_ids_resume_without_cross_question_cache_hits(self):
+        from lighteval.utils.cache_management import SampleCache
+        from src.rwkv_eval.main import RWKVRegistry
+
+        config = LightevalTaskConfig(
+            name="openbookqa",
+            prompt_function=lambda line, name: Doc(
+                task_name=name, query=line["query"], choices=["A", "B"], gold_index=line["gold"]
+            ),
+            hf_repo="fixture",
+            hf_subset="default",
+            hf_avail_splits=["validation", "test"],
+            evaluation_splits=["validation", "test"],
+            metrics=[Metrics.loglikelihood_acc],
+        )
+        with patch.object(Registry, "load_all_task_configs", return_value={config.name: config}):
+            registry = RWKVRegistry(tasks="openbookqa")
+            task = registry.load_tasks()["openbookqa|0"]
+        task.dataset = {
+            "validation": [{"query": "Validation question\nAnswer: ", "gold": 1}],
+            "test": [{"query": "Test question\nAnswer: ", "gold": 0}],
+        }
+        docs = task.get_docs()
+        responses = [
+            ModelResponse(
+                input=doc.query,
+                candidate_inputs=[doc.query + choice for choice in doc.choices],
+                logprobs=[-1.0 if i == doc.gold_index else -5.0 for i in range(2)],
+            )
+            for doc in docs
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            model_config = DummyModelConfig(model_name="fixture", cache_dir=directory)
+            cache = SampleCache(model_config)
+            cache._init_registry(registry)
+            cache.cache_sample(docs[0], responses[0], SamplingMethod.LOGPROBS)
+            resumed = SampleCache(model_config)
+            resumed._init_registry(registry)
+            missing, cached_tasks = resumed.get_samples_to_process_and_cache(docs, SamplingMethod.LOGPROBS)
+            self.assertEqual([doc.id for doc in missing], [docs[1].id])
+            self.assertEqual(
+                resumed.get_samples_from_cache([docs[0]], cached_tasks, SamplingMethod.LOGPROBS)[0].input,
+                docs[0].query,
+            )
+            resumed.cache_sample(docs[1], responses[1], SamplingMethod.LOGPROBS)
+            task_ids = {resumed.get_task_id(task.full_name, SamplingMethod.LOGPROBS)}
+            resumed.cache_samples(docs, responses, task_ids, SamplingMethod.LOGPROBS)
+            reopened = SampleCache(model_config)
+            reopened._init_registry(registry)
+            self.assertEqual(reopened.get_samples_to_process_and_cache(docs, SamplingMethod.LOGPROBS)[0], [])
+            ordered = reopened.get_samples_from_cache(docs[::-1], task_ids, SamplingMethod.LOGPROBS)
+            self.assertEqual(
+                [asdict(response) for response in ordered], [asdict(response) for response in responses[::-1]]
+            )
+            again = task.get_docs()
+            self.assertEqual({doc.id: doc.query for doc in again}, {doc.id: doc.query for doc in docs})
 
     def test_rwkv_choice_expectation_is_private_and_preserves_failure_details(self):
         from lighteval.metrics.metrics_sample import PassAtK
@@ -1353,7 +1504,6 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual(RWKVExactMatches().compute_one_item(r"\cot x", "cot x"), 1)
         self.assertEqual(RWKVExactMatches().compute_one_item(r"\cot x", "tan x"), 0)
         self.assertEqual(extract_math_answer("[-2,300]"), "[-2,300]")
-
 
 if __name__ == "__main__":
     unittest.main()

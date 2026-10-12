@@ -155,7 +155,7 @@ class RWKVPassAtK(PassAtK):
         return super().pass_at_k(all_scores)
 
 
-def rwkv_prompt(line, task_name=None, *, prompt_function):
+def rwkv_prompt(line, task_name=None, *, prompt_function):  # noqa: C901
     """Adapt a native prompt only for the RWKV registry's copied configs."""
     doc = prompt_function(line, task_name)
     if doc is None:
@@ -190,8 +190,14 @@ def rwkv_prompt(line, task_name=None, *, prompt_function):
         if task_name == "commonsenseqa":
             doc.query = doc.query.removeprefix(doc.instruction or "")
             doc.instruction = ""
-        if doc.query.rstrip().endswith("Answer:"):
-            doc.query = doc.query.rstrip()[: -len("Answer:")].rstrip() + "\n"
+    # Prototype: arc_prompt/mmlu_prompt. All RWKV LOGPROBS candidates follow
+    # a newline-delimited answer cue; retain an existing cue's whitespace.
+    # Only generation delegates the answer boundary to the chat template.
+    if _auto_cot_mode(task_name)[0] == "NoCoT":
+        if not doc.query.rstrip().endswith("\nAnswer:"):
+            doc.query = doc.query.rstrip().removesuffix("Answer:").rstrip() + "\nAnswer: "
+    elif doc.query.rstrip().endswith("Answer:"):
+        doc.query = doc.query.rstrip()[: -len("Answer:")].rstrip() + "\n"
     return doc
 
 
@@ -208,10 +214,34 @@ class RWKVLightevalTaskConfig(LightevalTaskConfig):
         return super().__str__(lite=lite)
 
 
-class RWKVRegistry(Registry):
-    """Prototype: Registry._update_task_configs; changes stay in copied tasks."""
+class RWKVLightevalTask(LightevalTask):
+    """Prototype: LightevalTask._get_docs_from_split; split-local cache IDs."""
 
-    def _update_task_configs(self):
+    def _get_docs_from_split(self, splits: list[str], few_shots=False):
+        if few_shots or len(self.evaluation_split) <= 1:
+            return super()._get_docs_from_split(splits, few_shots=few_shots)
+        docs = []
+        for split in splits:
+            split_docs = super()._get_docs_from_split([split], few_shots=few_shots)
+            for doc in split_docs:
+                doc.id = f"{split}:{doc.id}"
+            docs.extend(split_docs)
+        return docs
+
+
+class RWKVRegistry(Registry):
+    """Prototype: Registry; task and output policy stay private to RWKV."""
+
+    def load_tasks(self) -> dict[str, LightevalTask]:
+        if len(self.task_to_configs) == 0:
+            return {config.full_name: RWKVLightevalTask(config=config) for config in self._task_registry.values()}
+        return {
+            config.full_name: RWKVLightevalTask(config=config)
+            for configs in self.task_to_configs.values()
+            for config in configs
+        }
+
+    def _update_task_configs(self):  # noqa: C901
         configs = super()._update_task_configs()
         from inspect_ai.scorer import choice
         from inspect_ai.solver import multiple_choice
@@ -227,6 +257,8 @@ class RWKVRegistry(Registry):
                 config.prompt_function = partial(rwkv_prompt, prompt_function=config.prompt_function)
                 mode, _ = _auto_cot_mode(config.name)
                 if mode == "NoCoT":
+                    # Prototype: native task version; invalidate pre-cue caches.
+                    config.version += 1
                     config.solver = [multiple_choice(cache=True)]
                     config.scorer = choice()
                     # Request routing is determined by metric category, not

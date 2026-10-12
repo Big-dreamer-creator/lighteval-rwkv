@@ -198,7 +198,21 @@ native task loaded before and after RWKV evaluation has unchanged behavior.
 - Check the exact prefix and each candidate sent by the adapter. The selected
   candidate input displayed in details must be a retained request string, not
   choices reconstructed by the publisher. Continuation tasks such as ARC and
-  Winogrande do not send all alternatives in one prompt.
+  Winogrande do not send all alternatives in one prompt. Preserve the native
+  trailing `\nAnswer:` (including its whitespace) for NoCoT/LOGPROBS: it is
+  the candidate-scoring boundary, not a generated chat wrapper. The user
+  explicitly approved requiring it for every RWKV NoCoT/LOGPROBS task. If a
+  native prompt lacks this newline-delimited cue, append `\nAnswer: ` in the
+  private RWKV formatter, following `arc_prompt`/`mmlu_prompt`; move an inline
+  trailing `Answer:` to its own line without duplicating it. Keep candidates,
+  golds, dataset splits, solver/scorer and metrics unchanged. Only generative
+  RWKV prompts remove that suffix. Audit every expanded subtask, not only a
+  representative: BBH contains both existing-cue and missing-cue prompts.
+  Record affected published IDs and migrate caches only by exact retained
+  prefix/candidate input equality before the required two-model smoke tests.
+  Increment only copied NoCoT task versions, following the native task-version
+  prototype, so ordinary cache resumption cannot accept pre-cue requests.
+  Generative and non-RWKV versions remain unchanged.
 - Generation uses `GENERATIVE` and `/v1/chat/completions`, with captured
   server-rendered text. No rendered prompt means no publication. Reasoning must
   not inherit an answer-only newline stop. Send the configured generated-token
@@ -324,6 +338,15 @@ candidate batch larger than the configured pool occupies it alone. Native choice
 requests, candidate token sums and output ordering are unchanged. Prototype:
 the same RWKV completion journal and native `SampleCache`.
 Other LiteLLM providers retain their native batch request and caching behavior.
+
+For RWKV tasks evaluating multiple dataset splits, `RWKVLightevalTask` follows
+`LightevalTask._get_docs_from_split` and prefixes each evaluation row ID with its
+split (`validation:0`, `test:0`). Native tasks, single-split row IDs and few-shot
+IDs remain unchanged. OpenBookQA keeps validation + test (1000 documents), and
+MedQA keeps validation + test (2545 documents); prompts, choices, golds, metrics
+and sampling are unchanged. Resume each distinct document independently. Migrate
+retained responses only by matching their exact captured input and candidates
+to the current document, never by the old split-local numeric ID alone.
 
 RWKV model pools run in separate spawned processes, following the native dataset
 process-worker prototype. Each pool owns its full benchmark queue, native random
