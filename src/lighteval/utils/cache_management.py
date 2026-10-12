@@ -149,8 +149,9 @@ class SampleCache:
     def _load_sample_journal(self, cache_file: Path):
         """Prototype: _load_sample and EvaluationTracker's completion JSONL.
 
-        A killed writer can leave an incomplete last line. Recover only that
-        tail; completed, fsynced records remain available for resumption.
+        A killed writer can leave an incomplete last line. Ignore that tail
+        without mutating the file; only the owning writer may truncate it.
+        Completed, fsynced records remain available for resumption.
 
         Yields:
             Completed sample records in append order.
@@ -158,15 +159,18 @@ class SampleCache:
         journal = cache_file.with_suffix(".jsonl")
         if not journal.exists():
             return
-        with journal.open("r+b") as stream:
+        with journal.open("rb") as stream:
             offset = 0
             while line := stream.readline():
                 if not line.endswith(b"\n"):
-                    stream.truncate(offset)
-                    logger.warning("Discarded incomplete completion journal tail: %s", journal)
+                    logger.warning("Ignored incomplete completion journal tail: %s", journal)
                     break
+                try:
+                    row = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError(f"Corrupt completion journal {journal} at byte {offset}") from error
                 offset = stream.tell()
-                yield json.loads(line)
+                yield row
 
     def cache_sample(self, doc: Doc, result: ModelResponse, sampling_method: SamplingMethod):
         """Durably append a completed HTTP rollout from the owning reader thread."""
@@ -174,8 +178,28 @@ class SampleCache:
         journal = self.get_cache_path(task_id).with_suffix(".jsonl")
         journal.parent.mkdir(parents=True, exist_ok=True)
         row = {"sample_id": doc.id, "sample": self._dump_sample(result)}
-        with journal.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        with journal.open("a+b") as stream:
+            # Prototype: _load_sample_journal's interrupted-tail handling.
+            # Recovery belongs to the single owning writer, never a reader
+            # that may observe a response still being appended.
+            stream.seek(0, os.SEEK_END)
+            end = stream.tell()
+            if end:
+                stream.seek(end - 1)
+                if stream.read(1) != b"\n":
+                    offset = end
+                    while offset:
+                        start = max(0, offset - 8192)
+                        stream.seek(start)
+                        chunk = stream.read(offset - start)
+                        last_newline = chunk.rfind(b"\n")
+                        if last_newline >= 0:
+                            offset = start + last_newline + 1
+                            break
+                        offset = start
+                    stream.truncate(offset)
+                    logger.warning("Discarded incomplete completion journal tail: %s", journal)
+            stream.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
             stream.flush()
             os.fsync(stream.fileno())
         self.existing_indices.setdefault(task_id, []).append(doc.id)

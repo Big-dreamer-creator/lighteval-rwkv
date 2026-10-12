@@ -381,6 +381,26 @@ smoke scores/details before publishing corrected or resumed affected results.
 Only confirmed changed published scores may be expired; retain response caches
 and regrade identical requests rather than regenerating valid rollouts.
 
+### RWKV HTTP and completion-journal ownership
+
+RWKV generated requests retain LiteLLM's native request normalization, but each
+rollout explicitly owns its OpenAI SDK/httpx client through response consumption
+and retry completion. Close it in the requesting thread, never through a shared
+client-cache lifetime. Prototype: `BaseOpenAILLM._get_sync_http_client` and the
+existing native completion call. Non-RWKV requests keep their original client
+and provider-cache behavior; do not change concurrency, prompts, seeds, stop
+sequences or budgets for this transport fix.
+
+Optional rollout journals must be opened read-only by readers. Ignore an
+interrupted final line without truncation: another reader may observe an active
+append. Only `cache_sample`, the single owning writer, trims an incomplete tail
+before appending and fsyncing its next complete JSON record. Malformed complete
+records fail with the exact journal path and byte offset rather than being
+silently served or discarded. Preserve original corrupt files for investigation.
+When a foreign TLS record is proven to sit between intact JSON records, recovery
+may remove only its exact bytes after validating every remaining response's
+identity, native input, seed and budget; never replace answers or golds.
+
 ### RWKV budget and completion-cache contract
 
 RWKV budgets such as 4096/8192/16384/24576 limit generated tokens, not total

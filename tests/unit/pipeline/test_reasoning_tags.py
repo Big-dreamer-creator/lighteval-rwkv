@@ -1210,6 +1210,174 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual([d.sampling_config.max_generated_tokens for d in score.passed_details], [14, 2])
         self.assertEqual(payload["passed_details"][0]["messages"][0]["content"], "server prompt")
 
+    def test_rwkv_generation_client_is_owned_until_response_consumed(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier, get_ident
+        from types import SimpleNamespace
+
+        from lighteval.models.endpoints.litellm_model import LiteLLMClient, LiteLLMModelConfig
+        from lighteval.models.model_input import GenerationParameters
+
+        barrier = Barrier(2)
+        clients = []
+
+        class OwnedClient:
+            def __init__(self, **kwargs):
+                self.owner = get_ident()
+                self.closed = False
+                clients.append(self)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.assert_owner()
+                self.closed = True
+
+            def assert_owner(self):
+                if self.owner != get_ident() or self.closed:
+                    raise AssertionError("transport closed or used by non-owner")
+
+        def completion(**kwargs):
+            kwargs["client"].assert_owner()
+            self.assertFalse(kwargs["caching"])
+            barrier.wait(timeout=5)
+            kwargs["client"].assert_owner()
+            return SimpleNamespace(
+                usage=SimpleNamespace(prompt_tokens=2),
+                choices=[SimpleNamespace(message=SimpleNamespace(content="42"))],
+                _hidden_params={},
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = LiteLLMModelConfig(
+                model_name="test-rwkv",
+                provider="openai",
+                base_url="https://example.test/v1",
+                cache_dir=directory,
+                max_model_length=16,
+                extra_body={"chat_template_kwargs": {"rwkv_generation_prompt": "open_think"}},
+                generation_parameters=GenerationParameters(temperature=0.96, seed=42),
+            )
+            model = LiteLLMClient(config)
+            with (
+                patch("lighteval.models.endpoints.litellm_model.OpenAI", side_effect=OwnedClient),
+                patch("lighteval.models.endpoints.litellm_model.httpx.Client"),
+                patch("lighteval.models.endpoints.litellm_model.litellm.completion", side_effect=completion),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                futures = [
+                    executor.submit(
+                        model._LiteLLMClient__call_api, [{"role": "user", "content": "Q"}], False, 16, 1, []
+                    )
+                    for _ in range(2)
+                ]
+                for future in futures:
+                    self.assertEqual(future.result().choices[0].message.content, "42")
+            self.assertEqual(len(clients), 2)
+            self.assertIsNot(clients[0], clients[1])
+            self.assertTrue(all(client.closed for client in clients))
+            config.extra_body = None
+            config.model_name = "gpt-test"
+            with (
+                patch("lighteval.models.endpoints.litellm_model.OpenAI", side_effect=AssertionError("native changed")),
+                patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False),
+                patch("lighteval.models.endpoints.litellm_model.litellm.completion") as call,
+            ):
+                model._LiteLLMClient__call_api([{"role": "user", "content": "Q"}], False, 8, 1, [])
+                self.assertNotIn("client", call.call_args.kwargs)
+                self.assertTrue(call.call_args.kwargs["caching"])
+
+    def test_rwkv_owned_transport_preserves_normalized_request(self):
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+
+        import httpx
+        from litellm.llms.openai.common_utils import BaseOpenAILLM
+        from pydantic import SecretStr
+
+        from lighteval.models.endpoints import litellm_model
+        from lighteval.models.model_input import GenerationParameters
+
+        payloads = []
+        transports = []
+
+        def handler(request):
+            payloads.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={
+                    "id": "wire-test",
+                    "created": 1,
+                    "model": "rwkv-wire-test",
+                    "object": "chat.completion",
+                    "prompt_text": "server prompt",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "42"}, "finish_reason": "stop"}
+                    ],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+                },
+            )
+
+        def factory(**kwargs):
+            client = httpx.Client(transport=httpx.MockTransport(handler))
+            transports.append(client)
+            return client
+
+        with tempfile.TemporaryDirectory() as directory:
+            model = litellm_model.LiteLLMClient(
+                litellm_model.LiteLLMModelConfig(
+                    model_name="rwkv-wire-test",
+                    provider="openai",
+                    api_key=SecretStr("test-key"),
+                    base_url="https://wire-test.invalid/v1",
+                    cache_dir=directory,
+                    max_model_length=32,
+                    api_max_retry=1,
+                    extra_body={"chat_template_kwargs": {"rwkv_generation_prompt": "open_think"}},
+                    generation_parameters=GenerationParameters(temperature=0.96, top_p=0.76, seed=42),
+                )
+            )
+            try:
+                with (
+                    patch.object(litellm_model, "httpx", SimpleNamespace(Client=factory)),
+                    patch.object(BaseOpenAILLM, "_get_sync_http_client", side_effect=factory),
+                ):
+                    with patch.object(litellm_model, "OpenAI", return_value=nullcontext()):
+                        model._LiteLLMClient__call_api([{"role": "user", "content": "Q"}], False, 16, 1, [], 1)
+                    model._LiteLLMClient__call_api([{"role": "user", "content": "Q"}], False, 16, 1, [], 1)
+                self.assertEqual(len(payloads), 2)
+                self.assertEqual(payloads[0], payloads[1])
+                self.assertEqual(payloads[1]["seed"], 43)
+                self.assertEqual(payloads[1]["max_completion_tokens"], 16)
+                self.assertEqual(payloads[1]["stop"], [])
+                self.assertEqual(payloads[1]["messages"], [{"role": "user", "content": "Q"}])
+            finally:
+                for client in transports:
+                    client.close()
+
+    def test_rwkv_journal_reader_never_truncates_an_active_writer(self):
+        from lighteval.utils.cache_management import SampleCache
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache = SampleCache(DummyModelConfig(model_name="test", cache_dir=directory))
+            path = Path(directory) / "GENERATIVE.parquet"
+            journal = path.with_suffix(".jsonl")
+            first = (json.dumps({"sample_id": "0", "sample": asdict(ModelResponse(text=["first"]))}) + "\n").encode()
+            second = (json.dumps({"sample_id": "1", "sample": asdict(ModelResponse(text=["second"]))}) + "\n").encode()
+            journal.write_bytes(first + second[:30])
+            with journal.open("ab") as writer:
+                self.assertEqual(len(list(cache._load_sample_journal(path))), 1)
+                self.assertEqual(journal.read_bytes(), first + second[:30])
+                writer.write(second[30:])
+                writer.flush()
+            self.assertEqual([r["sample_id"] for r in cache._load_sample_journal(path)], ["0", "1"])
+            damaged = first + b"\x17\x03\x03\x02\x7f\x85\n" + second
+            journal.write_bytes(damaged)
+            with self.assertRaisesRegex(ValueError, f"Corrupt completion journal .* at byte {len(first)}"):
+                list(cache._load_sample_journal(path))
+            self.assertEqual(journal.read_bytes(), damaged)
+
     def test_rwkv_rollout_journal_recovers_only_missing_child(self):
         from types import SimpleNamespace
 
@@ -1263,9 +1431,10 @@ class TestRWKVNonInterference(unittest.TestCase):
             self.assertEqual(len(journal.read_text().splitlines()), 1)
             with journal.open("ab") as stream:
                 stream.write(b'{"sample_id":"incomplete')
+            interrupted = journal.read_bytes()
             resumed = LiteLLMClient(config)
             resumed.prompt_manager.prepare_prompt_api = model.prompt_manager.prepare_prompt_api
-            self.assertEqual(len(journal.read_text().splitlines()), 1)
+            self.assertEqual(journal.read_bytes(), interrupted)
             calls = []
 
             def complete(**kwargs):

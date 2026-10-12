@@ -183,3 +183,7 @@ prod_env
 logs
 _logs
 outputs
+
+# Local evaluation results and provider caches
+/results/
+/.litellm_cache/

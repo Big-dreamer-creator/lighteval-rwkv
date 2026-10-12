@@ -23,6 +23,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import replace
 from json import JSONDecodeError
 from typing import Any
@@ -74,11 +75,14 @@ def _strip_question_answer_completion_template(prompt: Any) -> Any:
 
 
 if is_package_available("litellm"):
+    import httpx
     import litellm
     from litellm import encode, supports_reasoning
     from litellm.caching.caching import Cache, LiteLLMCacheType
+    from litellm.llms.custom_httpx.http_handler import get_ssl_configuration
     from litellm.utils import ModelResponse as LitellmModelResponse
     from litellm.utils import get_max_tokens
+    from openai import OpenAI
 
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").handlers.clear()
@@ -324,43 +328,59 @@ class LiteLLMClient(LightevalModel):
                 extra_body.setdefault("return_prompt_text", True)
             kwargs["extra_body"] = extra_body
 
+        # Prototype: BaseOpenAILLM._get_sync_http_client and the native
+        # completion call. Each RWKV rollout owns its SDK/transport through
+        # response consumption and retries, then closes it in the requesting
+        # thread. LiteLLM retains its native request normalization; other
+        # providers retain their shared client-cache behavior.
+        client_context = (
+            OpenAI(
+                api_key=self.api_key or "EMPTY",
+                base_url=self.base_url,
+                timeout=kwargs["timeout"],
+                http_client=httpx.Client(verify=get_ssl_configuration(), follow_redirects=True),
+            )
+            if rwkv_generation_prompt in {"fake_think", "open_think"}
+            else nullcontext()
+        )
         last_error: BaseException | None = None
-        for attempt in range(self.API_MAX_RETRY):
-            try:
-                response = litellm.completion(**kwargs)
-                content = response.choices[0].message.content
-
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                if not content:
-                    logger.info("Response is empty, retrying without caching")
-                    kwargs["caching"] = False
+        with client_context as client:
+            if rwkv_generation_prompt in {"fake_think", "open_think"}:
+                kwargs["client"] = client
+            for attempt in range(self.API_MAX_RETRY):
+                try:
                     response = litellm.completion(**kwargs)
                     content = response.choices[0].message.content
 
-                if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                    response._hidden_params["rwkv_prompt_token_count"] = response.usage.prompt_tokens
-                    response._hidden_params["rwkv_effective_max_new_tokens"] = max_new_tokens
-                    response._hidden_params["rwkv_seed"] = kwargs.get("seed")
-                return response
-            except litellm.BadRequestError as e:
-                if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                    raise
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
+                    # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
+                    if not content:
+                        logger.info("Response is empty, retrying without caching")
+                        kwargs["caching"] = False
+                        response = litellm.completion(**kwargs)
+                        content = response.choices[0].message.content
+
+                    if rwkv_generation_prompt in {"fake_think", "open_think"}:
+                        response._hidden_params["rwkv_prompt_token_count"] = response.usage.prompt_tokens
+                        response._hidden_params["rwkv_effective_max_new_tokens"] = max_new_tokens
+                        response._hidden_params["rwkv_seed"] = kwargs.get("seed")
+                    return response
+                except litellm.BadRequestError as e:
+                    if rwkv_generation_prompt in {"fake_think", "open_think"}:
+                        raise
+                    if "message" in e.__dict__:
+                        error_string = "The response was filtered due to the prompt triggering Microsoft's content management policy"
+                        if error_string in e.__dict__["message"]:
+                            logger.warning(f"{error_string}. Returning empty response.")
+                            return LitellmModelResponse()
+                except Exception as e:
+                    last_error = e
+                    wait_time = min(
+                        64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
+                    )  # Exponential backoff with max 64s
+                    logger.warning(
+                        f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
                     )
-                    if error_string in e.__dict__["message"]:
-                        logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
-            except Exception as e:
-                last_error = e
-                wait_time = min(
-                    64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                )  # Exponential backoff with max 64s
-                logger.warning(
-                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
-                )
-                time.sleep(wait_time)
+                    time.sleep(wait_time)
 
         message = f"API call failed after {self.API_MAX_RETRY} attempts"
         logger.error(message)
