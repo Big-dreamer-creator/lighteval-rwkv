@@ -1505,6 +1505,133 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual(RWKVExactMatches().compute_one_item(r"\cot x", "tan x"), 0)
         self.assertEqual(extract_math_answer("[-2,300]"), "[-2,300]")
 
+    def test_rwkv_math_details_preserve_metric_gold_on_live_and_parquet_paths(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from lighteval.metrics import apply_metric
+        from src.rwkv_eval.answer_extract.free_response import extract_answer, extract_math_answer
+        from src.rwkv_eval.main import RWKVRegistry, _native_score, _sampling_config
+        from src.rwkv_eval.upload import get_detail, get_eg_details
+
+        native_before = Registry(tasks="math").load_tasks()
+        task = RWKVRegistry(tasks="math").load_tasks()["math:prealgebra|0"]
+        sampling = _sampling_config("CoT", 24576, 42)
+        for gold, prediction, passed in (
+            (r"\mbox{Saturday}", "Saturday", True),
+            (r"\mbox{Saturday}", "Thursday", False),
+            ("90\\text{ square\nunits}", "90", True),
+            ("90\\text{ square\nunits}", "91", False),
+            ("90\\text{ square\nunits}", None, False),
+            (r"2k", "2", False),
+            (r"3032_5", "3032", True),
+        ):
+            with self.subTest(gold=gold, prediction=prediction):
+                line = {"problem": "Q?", "solution": r"Solution: \boxed{" + gold + "}"}
+                doc = task.formatter(line, task.name)
+                self.assertEqual(doc.get_golds(), [gold])
+                raw = "unfinished" if prediction is None else r"reasoning</think>\boxed{" + prediction + "}"
+                response = ModelResponse(
+                    text=[raw] * 4,
+                    text_post_processed=[extract_answer(raw, "math") or ""] * 4,
+                    input="User: Q?\n\nAssistant: <think>",
+                    rendered_prompt="User: Q?\n\nAssistant: <think>",
+                    finish_reasons=["stop"] * 4,
+                    effective_max_new_tokens=24576,
+                    seeds=[42, 43, 44, 45],
+                )
+                metric = apply_metric([response], [doc], task.metrics)[0]
+                self.assertEqual(_native_score(metric), float(passed))
+                detail, bucket = get_detail(doc, response, sampling, metric, 0, no_cot=False)
+                self.assertEqual(detail.ground_truth, gold)
+                self.assertEqual(detail.answer, prediction if prediction is not None else "-")
+                self.assertEqual(detail.is_passed, passed)
+                self.assertEqual(bucket, 2 if prediction is None else 0 if passed else 1)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "details" / "model" / "date" / "details.parquet"
+                    path.parent.mkdir(parents=True)
+                    sampling_path = Path(directory) / "results" / "model" / "sampling_config_date.json"
+                    sampling_path.parent.mkdir(parents=True)
+                    sampling_path.write_text(json.dumps(asdict(sampling)))
+                    row = {"doc": asdict(doc), "model_response": asdict(response), "metric": metric}
+                    pq.write_table(pa.Table.from_pylist([row]), path)
+                    replay = get_eg_details(path, task_name=doc.task_name)
+                    self.assertEqual(replay[bucket], [detail] * 4)
+        # Keep the shared extractor and every native task untouched.
+        self.assertIsNone(extract_math_answer(r"\mbox{Saturday}"))
+        self.assertIsNone(extract_math_answer("90\\text{ square\nunits}"))
+        native_after = Registry(tasks="math").load_tasks()
+        for name, native in native_before.items():
+            self.assertEqual(str(native.config), str(native_after[name].config))
+
+    def test_rwkv_math_timeout_falls_back_to_full_string_comparison(self):
+        from src.rwkv_eval.answer_extract import free_response
+
+        free_response.verify_math_answer.cache_clear()
+        with (
+            patch.object(free_response, "_get_math_worker") as get_worker,
+            patch.object(free_response, "_stop_math_worker") as stop_worker,
+        ):
+            connection = get_worker.return_value
+            connection.poll.return_value = False
+            self.assertTrue(free_response.verify_math_answer(" 100 ", "100"))
+            get_worker.assert_not_called()
+            for gold, pred in (("100", "100+0"), ("100", "100 or 200"), ("1/2", r"\frac{1}{2}")):
+                with self.subTest(gold=gold, pred=pred):
+                    self.assertFalse(free_response.verify_math_answer(gold, pred))
+                    args = connection.send.call_args.args[0]
+                    self.assertEqual(args[:3], (gold, pred, False))
+                    self.assertLessEqual(connection.poll.call_args.args[0], 5)
+            self.assertEqual(stop_worker.call_count, 3)
+            connection.poll.return_value = True
+            connection.recv.side_effect = EOFError
+            self.assertFalse(free_response.verify_math_answer("2", "2+0"))
+            self.assertEqual(stop_worker.call_count, 4)
+        free_response.verify_math_answer.cache_clear()
+
+    def test_rwkv_math_worker_does_not_reimport_callers_main(self):
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-"],
+            input=(
+                "from src.rwkv_eval.answer_extract.free_response import verify_math_answer\n"
+                "assert verify_math_answer('1/4', r'\\frac{1}{4}')\n"
+                "print('verified')\n"
+            ),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "verified")
+
+    def test_rwkv_math_verification_bounds_huge_power_and_recovers(self):
+        import concurrent.futures
+        import time
+
+        from src.rwkv_eval.answer_extract import free_response
+
+        free_response.verify_math_answer.cache_clear()
+        try:
+            self.assertTrue(free_response.verify_math_answer("1/2", r"\frac{1}{2}"))
+            worker = free_response._math_worker
+            started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                value = executor.submit(
+                    free_response.verify_math_answer, "100", r"3 \cdot 8^{\frac{\binom{200}{100}}{2} - 1}"
+                ).result(timeout=10)
+            self.assertFalse(value)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIsNone(free_response._math_worker)
+            self.assertIsNone(free_response._math_connection)
+            self.assertTrue(free_response.verify_math_answer("1/3", r"\frac{1}{3}"))
+            self.assertIsNot(free_response._math_worker, worker)
+        finally:
+            free_response._stop_math_worker()
+            free_response.verify_math_answer.cache_clear()
+
     def test_rwkv_emoji_checker_preserves_native_valid_results(self):
         from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, RWKVEmojiSentenceChecker
 

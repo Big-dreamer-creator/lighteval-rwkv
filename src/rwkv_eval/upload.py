@@ -279,7 +279,12 @@ def get_detail(  # noqa: C901
         raw_answer = response.text[index] if response.text else ""
         answer = extract_answer(raw_answer, extractor, len(doc.choices), rendered_prompt=response.rendered_prompt)
         if extractor in {"math", "short_answer"}:
-            golds = [gold if extractor == "short_answer" else extract_math_answer(gold) for gold in golds]
+            # Prototype: rwkv_prompt already extracts MATH's balanced gold box.
+            # Re-extracting that concise value can reject text/multiline LaTeX
+            # or turn a complete expression into its last numeric token. Keep
+            # the exact gold used by the native metric, also on parquet replay.
+            if doc.task_name.split("|", 1)[0].split(":", 1)[0] != "math":
+                golds = [gold if extractor == "short_answer" else extract_math_answer(gold) for gold in golds]
             if any(gold is None for gold in golds):
                 raise ValueError("RWKV detail contains an unextractable gold answer")
             score = float(

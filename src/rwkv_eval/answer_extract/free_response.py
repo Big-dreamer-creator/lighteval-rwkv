@@ -2,8 +2,26 @@
 
 from __future__ import annotations
 
+import atexit
+import logging
+import os
 import re
+import resource
+import subprocess
+import sys
+import threading
+import time
+from functools import lru_cache
+from multiprocessing import Pipe
+from pathlib import Path
 
+
+LOGGER = logging.getLogger(__name__)
+_MATH_TIMEOUT_SECONDS = 5
+_MATH_MEMORY_HEADROOM = 2 * 1024**3
+_math_lock = threading.Lock()
+_math_worker = None
+_math_connection = None
 
 _CODE_BLOCK = re.compile(r"```(?:python|py)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
 _BOXED = re.compile(r"\\boxed\s*\{")
@@ -194,12 +212,8 @@ def extract_answer(
     return text or None
 
 
-def verify_math_answer(gold: str, text: str, *, allow_text: bool = False) -> bool:
-    """Albatross-style exact agreement followed by native math equivalence.
-
-    Prototype: Metrics.pass_at_k_math's MultilingualExtractiveMatchMetric.
-    Callers supply concise values; box them for the native LaTeX extractor.
-    """
+def _verify_math_answer(gold: str, text: str, *, allow_text: bool = False) -> bool:
+    """Prototype: verify_math_answer; native comparison inside the bounded worker."""
     if not gold or not text:
         return False
     if gold.strip() == text.strip():
@@ -209,7 +223,7 @@ def verify_math_answer(gold: str, text: str, *, allow_text: bool = False) -> boo
         answer = text.strip("()[] ")
         answers = answer.split(";") if ";" in answer else answer.split(",")
         return len(golds) == len(answers) and all(
-            verify_math_answer(g, a, allow_text=True) for g, a in zip(golds, answers)
+            _verify_math_answer(g, a, allow_text=True) for g, a in zip(golds, answers)
         )
     if allow_text and _SHORT_TEXT.fullmatch(gold.strip()):
         # Follow the native exact-match contract for textual targets; names
@@ -232,6 +246,110 @@ def verify_math_answer(gold: str, text: str, *, allow_text: bool = False) -> boo
     doc = Doc(query="", choices=[f"$\\boxed{{{gold}}}$"], gold_index=0)
     response = ModelResponse(text=[f"$\\boxed{{{text}}}$"])
     return comparator.compute(doc, response) == 1.0
+
+
+def _math_worker_main(connection):
+    """Prototype: timeout's process isolation; reuse native imports between answers."""
+    # Warm imports/parser before the verification deadline. Limit further virtual
+    # allocation so a rapid integer expansion cannot exhaust the host before 5s.
+    _verify_math_answer("0", "1")
+    virtual_memory = int(Path("/proc/self/statm").read_text().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+    memory_limit = virtual_memory + _MATH_MEMORY_HEADROOM
+    resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+    connection.send("ready")
+    while True:
+        try:
+            gold, text, allow_text, deadline = connection.recv()
+        except EOFError:
+            break
+        try:
+            result = _verify_math_answer(gold, text, allow_text=allow_text)
+        except MemoryError:
+            result = None
+        if time.monotonic() >= deadline:
+            result = None
+        connection.send(result)
+    connection.close()
+
+
+def _stop_math_worker():
+    """Prototype: timeout's terminate/join; never leave a timed-out calculation running."""
+    global _math_worker, _math_connection
+    if _math_worker is not None:
+        if _math_worker.poll() is None:
+            _math_worker.terminate()
+        try:
+            _math_worker.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            _math_worker.kill()
+            _math_worker.wait(timeout=1)
+        _math_worker = None
+    if _math_connection is not None:
+        _math_connection.close()
+        _math_connection = None
+
+
+def _get_math_worker():
+    global _math_worker, _math_connection
+    if _math_worker is None or _math_worker.poll() is not None:
+        _stop_math_worker()
+        _math_connection, child_connection = Pipe()
+        # A clean interpreter imports only the verifier, not the caller's main
+        # script (which may be unguarded or stdin). Prototype: LCB's Popen sandbox.
+        worker_code = (
+            "import sys; from multiprocessing.connection import Connection; "
+            "from src.rwkv_eval.answer_extract.free_response import _math_worker_main; "
+            "_math_worker_main(Connection(int(sys.argv[1])))"
+        )
+        _math_worker = subprocess.Popen(
+            [sys.executable, "-c", worker_code, str(child_connection.fileno())],
+            pass_fds=(child_connection.fileno(),),
+            cwd=Path(__file__).resolve().parents[3],
+            stdin=subprocess.DEVNULL,
+        )
+        child_connection.close()
+        if not _math_connection.poll(30):
+            _stop_math_worker()
+            raise TimeoutError("RWKV math verifier failed to initialize")
+        try:
+            _math_connection.recv()
+        except EOFError:
+            _stop_math_worker()
+            raise RuntimeError("RWKV math verifier exited during initialization") from None
+    return _math_connection
+
+
+@lru_cache(maxsize=4096)
+def verify_math_answer(gold: str, text: str, *, allow_text: bool = False) -> bool:
+    """Bound parsing/comparison to 5s, then fall back to full stripped equality.
+
+    Prototypes: native MultilingualExtractiveMatchMetric, timeout's process
+    isolation and LCB's Popen sandbox. Worker initialization is separate from
+    this deadline; caller threads cannot disable it. Terminate timed-out work
+    before returning the fallback result.
+    """
+    if not gold or not text:
+        return False
+    if gold.strip() == text.strip():
+        return True
+    if allow_text and _SHORT_TEXT.fullmatch(gold.strip()) and ";" not in gold:
+        return False
+    with _math_lock:
+        connection = _get_math_worker()
+        deadline = time.monotonic() + _MATH_TIMEOUT_SECONDS
+        try:
+            connection.send((gold, text, allow_text, deadline))
+            result = connection.recv() if connection.poll(max(0, deadline - time.monotonic())) else None
+        except (EOFError, OSError):
+            result = None
+        if result is not None and time.monotonic() < deadline:
+            return result
+        _stop_math_worker()
+    LOGGER.warning("RWKV math verification could not finish within 5s/resources; using full-string comparison")
+    return gold.strip() == text.strip()
+
+
+atexit.register(_stop_math_worker)
 
 
 def extract_code_answer(text: str) -> str:

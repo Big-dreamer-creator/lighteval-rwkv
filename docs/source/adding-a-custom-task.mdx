@@ -279,6 +279,14 @@ output-limit truncation. Both live and parquet publication use `get_detail` in
   their last number. Preserve commas in intervals and multi-part expressions.
   Failed extraction stays `None` internally and `"-"` in details; an unclosed
   thinking trace remains failed even if it mentions the correct answer.
+  For MATH, `rwkv_prompt` has already reduced each native solution to its
+  balanced boxed gold. Live and parquet publication must retain that exact
+  metric gold rather than running the response fallback extractor again.
+  Re-extraction rejects `\\mbox{Saturday}` and multiline text-unit expressions,
+  and can reduce complete values such as `2k` or `3032_5` to a numeric token.
+  The approved repair only removes this duplicate MATH gold extraction;
+  prediction extraction, mathematical verification, aggregation and all
+  other benchmark contracts remain unchanged.
 
 ### Approved RWKV expected-score restoration
 
@@ -341,6 +349,37 @@ sample's instruction results with zeroes. Regrade retained responses without
 changing prompts, budgets, task versions or cache inputs, prove unchanged
 results for previously successful grading, and complete both required model
 smoke tests before resuming the held production pair.
+
+### Approved RWKV five-second mathematical verification contract
+
+The user explicitly approved: `5秒内无法验证的直接回退到完整字符串匹配吧,
+不一样直接判错`. `verify_math_answer` keeps existing extracted golds/predictions,
+exact agreement and native `MultilingualExtractiveMatchMetric` equivalence.
+One five-second wall deadline covers parsing and comparison together, including
+all components of an ASDiv multi-part answer. On timeout or bounded worker
+failure, compare the complete stripped extracted strings; differing strings
+score zero. Do not search for a matching substring or change extraction,
+missing-answer handling, aggregation or request budgets.
+
+Prototype: native timeout's process isolation and LCB's `Popen` sandbox.
+Only the private verifier uses a reusable clean-interpreter worker with bounded
+virtual allocation headroom; terminate/join a timed-out worker before fallback and
+recreate it for the next comparison. Worker initialization is separate from the
+verification deadline. The caller's thread cannot disable this outer deadline.
+Keep native non-RWKV metrics and timeout utilities unchanged. Results/details
+use this same verifier; repeated comparisons may reuse its bounded result cache.
+
+Affected generative selectors: GSM8K, GSM Plus, ASDiv, Arithmetic, MATH,
+MATH-500, AIME24, AIME25, AIMO Progress Prize 1 and OlympiadBench, including their
+native expansions. Keep dataset fields/splits, queries, choices, gold indices,
+solver/scorer wiring and all sampling counts. CoT/FakeCoT remain GENERATIVE
+through `/v1/chat/completions` with captured rendered prompts, original templates,
+no newline stop and their existing 4096/24576 budgets. Keep extraction failure
+as None internally and `"-"` in details, and retain finish-reason truncation.
+Require hermetic fallback/resource/recovery tests and populated two-model
+smoke scores/details before publishing corrected or resumed affected results.
+Only confirmed changed published scores may be expired; retain response caches
+and regrade identical requests rather than regenerating valid rollouts.
 
 ### RWKV budget and completion-cache contract
 
