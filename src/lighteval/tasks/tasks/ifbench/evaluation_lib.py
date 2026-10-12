@@ -76,14 +76,17 @@ def write_outputs(output_jsonl_filename, outputs):
 def test_instruction_following_strict(
     inp,
     prompt_to_response,
+    *,
+    instruction_dict=None,
 ):
     """Tests response to see if instrutions are followed."""
     response = prompt_to_response[inp.prompt]
     instruction_list = inp.instruction_id_list
     is_following_list = []
 
+    instruction_dict = instructions_registry.INSTRUCTION_DICT if instruction_dict is None else instruction_dict
     for index, instruction_id in enumerate(instruction_list):
-        instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+        instruction_cls = instruction_dict[instruction_id]
         instruction = instruction_cls(instruction_id)
         inp.kwargs[index] = {key: value for key, value in inp.kwargs[index].items() if value is not None}
         instruction.build_description(**inp.kwargs[index])
@@ -108,6 +111,8 @@ def test_instruction_following_strict(
 def test_instruction_following_loose(
     inp,
     prompt_to_response,
+    *,
+    instruction_dict=None,
 ):
     """Tests response for an upper bound for following instructions."""
     response = prompt_to_response[inp.prompt]
@@ -132,8 +137,9 @@ def test_instruction_following_loose(
     instruction_list = inp.instruction_id_list
     is_following_list = []
 
+    instruction_dict = instructions_registry.INSTRUCTION_DICT if instruction_dict is None else instruction_dict
     for index, instruction_id in enumerate(instruction_list):
-        instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+        instruction_cls = instruction_dict[instruction_id]
         instruction = instruction_cls(instruction_id)
 
         instruction.build_description(**inp.kwargs[index])

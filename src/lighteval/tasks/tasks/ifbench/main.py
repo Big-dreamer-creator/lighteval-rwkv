@@ -34,6 +34,8 @@ from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.tasks.tasks.ifbench import evaluation_lib
+from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, RWKVEmojiSentenceChecker
+from lighteval.tasks.tasks.ifbench.instructions_registry import INSTRUCTION_DICT
 from lighteval.utils.imports import requires
 
 
@@ -57,6 +59,13 @@ submetric_names = [
 
 
 class IFBench(SampleLevelComputation):
+    # A neutral default must not add fields to native metric cache identities.
+    instruction_dict = None
+
+    def __init__(self, instruction_dict=None):
+        if instruction_dict is not None:
+            self.instruction_dict = instruction_dict
+
     def compute(self, doc: Doc, model_response: ModelResponse, **kwargs) -> dict:
         response = model_response.final_text[0]
 
@@ -72,8 +81,12 @@ class IFBench(SampleLevelComputation):
         prompt_to_response = {doc.query: response}
 
         # Use existing evaluation_lib functions
-        strict_result = evaluation_lib.test_instruction_following_strict(inp, prompt_to_response)
-        loose_result = evaluation_lib.test_instruction_following_loose(inp, prompt_to_response)
+        strict_result = evaluation_lib.test_instruction_following_strict(
+            inp, prompt_to_response, instruction_dict=self.instruction_dict
+        )
+        loose_result = evaluation_lib.test_instruction_following_loose(
+            inp, prompt_to_response, instruction_dict=self.instruction_dict
+        )
 
         return {
             "prompt_level_strict_acc": int(strict_result.follow_all_instructions),
@@ -81,6 +94,27 @@ class IFBench(SampleLevelComputation):
             "prompt_level_loose_acc": int(loose_result.follow_all_instructions),
             "inst_level_loose_acc": loose_result.follow_instruction_list,
         }
+
+
+class RWKVIFBench(IFBench):
+    """Prototype: IFBench; inject one checker without mutating its global registry."""
+
+    def __init__(self):
+        super().__init__(
+            instruction_dict={
+                key: RWKVEmojiSentenceChecker if checker is EmojiSentenceChecker else checker
+                for key, checker in INSTRUCTION_DICT.items()
+            }
+        )
+
+    def __str__(self):
+        # SampleLevelComputation serializes checker modules into task hashes.
+        # Keep existing response-cache identities when relocating this checker.
+        return (
+            super()
+            .__str__()
+            .replace(repr(RWKVEmojiSentenceChecker), "<class 'src.rwkv_eval.main.RWKVEmojiSentenceChecker'>")
+        )
 
 
 def agg_inst_level_acc(items):

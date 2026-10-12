@@ -911,6 +911,27 @@ class EmojiSentenceChecker(Instruction):
         return True
 
 
+class RWKVEmojiSentenceChecker(EmojiSentenceChecker):
+    """Prototype: EmojiSentenceChecker; empty punctuation fragments fail safely."""
+
+    def check_following(self, value):
+        sentences = instructions_util.split_into_sentences(value)
+        for i, sentence in enumerate(sentences):
+            stripped = sentence.translate(str.maketrans("", "", string.punctuation)).strip()
+            if not stripped:
+                return False
+            last_char = stripped[-1]
+            second_last_char = stripped[-2] if len(stripped) > 1 else stripped[-1]
+            if not emoji.is_emoji(last_char) and not emoji.is_emoji(second_last_char):
+                if i < len(sentences) - 1:
+                    stripped = sentences[i + 1].translate(str.maketrans("", "", string.punctuation)).strip()
+                    if not stripped or not emoji.is_emoji(stripped[0]):
+                        return False
+                else:
+                    return False
+        return True
+
+
 class CharacterCountUniqueWordsChecker(Instruction):
     """Respond with three sentences, all containing the same number of characters but using all different words."""
 

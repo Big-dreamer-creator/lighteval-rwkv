@@ -1505,5 +1505,109 @@ class TestRWKVNonInterference(unittest.TestCase):
         self.assertEqual(RWKVExactMatches().compute_one_item(r"\cot x", "tan x"), 0)
         self.assertEqual(extract_math_answer("[-2,300]"), "[-2,300]")
 
+    def test_rwkv_emoji_checker_preserves_native_valid_results(self):
+        from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, RWKVEmojiSentenceChecker
+
+        for sentences in (
+            ["Done. 😊"],
+            ["A sentence.", "😊 Another sentence. 😄"],
+            ["Missing emoji."],
+            ["Done. 😊", "Missing emoji."],
+            [],
+        ):
+            with (
+                self.subTest(sentences=sentences),
+                patch(
+                    "lighteval.tasks.tasks.ifbench.instructions.instructions_util.split_into_sentences",
+                    return_value=sentences,
+                ),
+            ):
+                self.assertEqual(
+                    RWKVEmojiSentenceChecker("emoji").check_following("response"),
+                    EmojiSentenceChecker("emoji").check_following("response"),
+                )
+        for sentences in ([")"], ["!"], ["   "], ["Missing emoji.", ")"]):
+            with (
+                self.subTest(sentences=sentences),
+                patch(
+                    "lighteval.tasks.tasks.ifbench.instructions.instructions_util.split_into_sentences",
+                    return_value=sentences,
+                ),
+            ):
+                self.assertFalse(RWKVEmojiSentenceChecker("emoji").check_following("response"))
+                with self.assertRaises(IndexError):
+                    EmojiSentenceChecker("emoji").check_following("response")
+
+    def test_rwkv_ifbench_strict_loose_and_registry_are_private(self):
+        from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, RWKVEmojiSentenceChecker
+        from lighteval.tasks.tasks.ifbench.instructions_registry import INSTRUCTION_DICT
+        from lighteval.tasks.tasks.ifbench.main import IFBench, RWKVIFBench
+        from src.rwkv_eval.main import RWKVRegistry
+
+        original = dict(INSTRUCTION_DICT)
+        emoji_id = next(key for key, checker in original.items() if checker is EmojiSentenceChecker)
+        native_before = Registry(tasks="ifbench_test,ifbench_multiturn").load_tasks()
+        private = RWKVRegistry(tasks="ifbench_test,ifbench_multiturn").load_tasks()
+        native_after = Registry(tasks="ifbench_test,ifbench_multiturn").load_tasks()
+        for name, task in private.items():
+            checker = task.metrics[0].sample_level_fn
+            self.assertIsInstance(checker, RWKVIFBench)
+            self.assertIs(checker.instruction_dict[emoji_id], RWKVEmojiSentenceChecker)
+            # Native task hashes stringify the checker mapping. Relocation must
+            # preserve the serialized identity of retained response caches.
+            expected_dict = str(checker.instruction_dict).replace(
+                repr(RWKVEmojiSentenceChecker), "<class 'src.rwkv_eval.main.RWKVEmojiSentenceChecker'>"
+            )
+            self.assertEqual(str(checker), f"RWKVIFBench(instruction_dict={expected_dict})")
+            self.assertEqual(native_before[name].config.version, task.config.version)
+            for native in (native_before[name], native_after[name]):
+                self.assertIs(type(native.metrics[0].sample_level_fn), IFBench)
+                self.assertIsNone(native.metrics[0].sample_level_fn.instruction_dict)
+                self.assertEqual(vars(native.metrics[0].sample_level_fn), {})
+                self.assertEqual(str(native.metrics[0].sample_level_fn), "IFBench()")
+            self.assertEqual(task.metrics[0].metric_name, native_before[name].metrics[0].metric_name)
+            self.assertEqual(task.config.solver, native_before[name].config.solver)
+        self.assertEqual(INSTRUCTION_DICT, original)
+        self.assertTrue(all(checker.instruction_dict[key] is cls for key, cls in original.items() if key != emoji_id))
+        doc = Doc(
+            query="Use an emoji after every sentence.",
+            choices=[""],
+            gold_index=0,
+            specific={"instruction_id_list": [emoji_id], "kwargs": [{}]},
+        )
+        with patch(
+            "lighteval.tasks.tasks.ifbench.instructions.instructions_util.split_into_sentences",
+            side_effect=lambda value: value.splitlines(),
+        ):
+            bad = ModelResponse(text=["Missing emoji.\n)"], text_post_processed=["Missing emoji.\n)"])
+            self.assertEqual(
+                RWKVIFBench().compute(copy.deepcopy(doc), bad),
+                {
+                    "prompt_level_strict_acc": 0,
+                    "inst_level_strict_acc": [False],
+                    "prompt_level_loose_acc": 0,
+                    "inst_level_loose_acc": [False],
+                },
+            )
+            with self.assertRaises(IndexError):
+                IFBench().compute(copy.deepcopy(doc), bad)
+            loose = ModelResponse(text=["Done. 😊\n)"], text_post_processed=["Done. 😊\n)"])
+            self.assertEqual(
+                RWKVIFBench().compute(copy.deepcopy(doc), loose),
+                {
+                    "prompt_level_strict_acc": 0,
+                    "inst_level_strict_acc": [False],
+                    "prompt_level_loose_acc": 1,
+                    "inst_level_loose_acc": [True],
+                },
+            )
+            for value in ("Done. 😊", "Missing emoji.", ""):
+                output = ModelResponse(text=[value], text_post_processed=[value])
+                self.assertEqual(
+                    RWKVIFBench().compute(copy.deepcopy(doc), output), IFBench().compute(copy.deepcopy(doc), output)
+                )
+        self.assertEqual(INSTRUCTION_DICT, original)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -183,8 +183,10 @@ request for the specific change is approval; otherwise ask before editing.
 ### 2. Keep RWKV policy private
 
 Follow `Registry._update_task_configs` and `Pipeline` as implementation
-prototypes. RWKV-only changes belong to `RWKVRegistry`/`RWKVPipeline` in
-`src/rwkv_eval/main.py`, using the registry's deep-copied configurations.
+prototypes. `RWKVRegistry`/`RWKVPipeline` in `src/rwkv_eval/main.py` wire RWKV
+policy through the registry's deep-copied configurations. Benchmark-specific
+checker and metric implementations belong with their benchmark modules, not
+the evaluation entry point; install them only on private RWKV configurations.
 Do not mutate `TASKS_TABLE`, metric singletons, native prompt functions, or
 process-wide registries. Shared optional response fields must have neutral
 defaults and survive indexing, caching and serialization. Demonstrate that a
@@ -310,6 +312,35 @@ reason. Validate native/RWKV/native isolation, mixed correct/wrong/missing
 rollouts and preserved failure details, then the required 1.5B/2.9B ten-question
 samples before publishing replacement scores; preserve old rows and exact
 request-budget evidence when regrading retained caches.
+
+### Approved RWKV IFBench emoji checker repair
+
+Prototypes: native `IFBench.compute`, `EmojiSentenceChecker.check_following`,
+and `evaluation_lib.test_instruction_following_strict/loose`. Keep the native
+`ifbench_test|0` (`allenai/IFBench_test`, default/train, 300 documents) and
+`ifbench_multiturn|0` (`allenai/IFBench_multi-turn`, ifbench_constraints/test,
+1387 documents) prompts, `instruction_id_list`/`kwargs`, empty textual choices,
+`gold_index=0`, all four metrics and their native aggregation. Instruction
+predicates, not the empty textual gold, define correctness. Requests remain
+CoT/GENERATIVE through `/v1/chat/completions`, captured assistant/open-think
+prompts, no newline stop, and 4096 generated tokens.
+
+The user approved fixing an `IndexError` when a punctuation-only sentence
+fragment becomes empty before character indexing. `RWKVRegistry` installs
+`RWKVIFBench` in `src/lighteval/tasks/tasks/ifbench/main.py` with a private
+instruction dictionary, replacing only `EmojiSentenceChecker` with
+`RWKVEmojiSentenceChecker` in the adjacent `instructions.py`. The entry point
+only imports and installs the private metric. Preserve its serialized checker
+identity in task hashing so moving the implementation does not invalidate
+retained response caches. The neutral default must also preserve the native
+`IFBench()` identity. Empty cleaned fragments return False; ordinary sentence checks and all eight native loose variants are
+unchanged. The native evaluator's optional dictionary defaults to its original
+registry, and native metric/scorer callers retain their original behavior.
+Do not mutate the global instruction dictionary or replace an entire failed
+sample's instruction results with zeroes. Regrade retained responses without
+changing prompts, budgets, task versions or cache inputs, prove unchanged
+results for previously successful grading, and complete both required model
+smoke tests before resuming the held production pair.
 
 ### RWKV budget and completion-cache contract
 

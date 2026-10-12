@@ -45,6 +45,7 @@ from lighteval.pipeline import Pipeline
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import SamplingMethod
+from lighteval.tasks.tasks.ifbench.main import RWKVIFBench
 from src.rwkv_eval.answer_extract.free_response import (
     answer_extractor_for_benchmark,
     extract_answer,
@@ -265,6 +266,8 @@ class RWKVRegistry(Registry):
                     # solver metadata (e.g. native MMLU uses exact_match).
                     if any(metric.category == SamplingMethod.GENERATIVE for metric in config.metrics):
                         config.metrics = [copy.deepcopy(Metrics.loglikelihood_acc.value)]
+                elif config.name in {"ifbench_test", "ifbench_multiturn"}:
+                    config.metrics[0].sample_level_fn = RWKVIFBench()
                 elif answer_extractor_for_benchmark(config.name) in {"math", "short_answer", "choice"}:
                     extractor = answer_extractor_for_benchmark(config.name)
                     # Change only private generative comparators. Native
