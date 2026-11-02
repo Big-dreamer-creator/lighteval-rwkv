@@ -148,7 +148,7 @@ def _parse_stored_model(record: dict[str, Any]) -> RwkvModel:
         if match := re.fullmatch(r"ctx(\d+)", part):
             context_length = int(match.group(1))
             break
-    return RwkvModel(parts[0], parts[1].capitalize(), parts[2], context_length)
+    return RwkvModel(parts[0], parts[1].capitalize(), parts[2], context_length, record["is_preview"])
 
 
 @dataclass
@@ -192,15 +192,20 @@ def get_score(file_path: str | Path) -> Score:
         or not 0 <= truncation_rate <= 1
     ):
         raise ValueError(f"{path}: results must contain a finite truncation_rate in [0, 1]")
-    metric_name = next(
+    metric_names = [
         name
         for name in task_metrics
         if not name.endswith("_stderr")
         and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"}
-    )
+    ]
+    if metric_names != ["avg@n"]:
+        raise ValueError(f"{path}: expected only the avg@n metric")
+    (metric_name,) = metric_names
     num_samples = task_config["effective_num_docs"]
     summary = record["summary_tasks"][task_name]
     avg_k = summary["n_completions"] / num_samples if summary["n_completions"] else 1
+    if avg_k < 1 or not float(avg_k).is_integer():
+        raise ValueError(f"{path}: avg_k must be a positive integer")
     results_root = next(parent for parent in path.parents if parent.name == "results")
     date_id = path.stem.removeprefix("results_")
     detail_path = (
